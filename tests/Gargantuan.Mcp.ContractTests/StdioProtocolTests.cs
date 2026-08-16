@@ -24,6 +24,9 @@ public sealed class StdioProtocolTests
             Assert.NotEmpty(Result.Content);
             Assert.NotEqual(true, Result.IsError);
             await Assert.ThrowsAnyAsync<Exception>(() => Client.CallToolAsync("unknown.tool", new Dictionary<string, object?>()).AsTask());
+            var InvalidResult = await Client.CallToolAsync("schema.list_classes", new Dictionary<string, object?> { ["PageSize"] = 201 });
+            Assert.True(InvalidResult.IsError);
+            Assert.NotNull(InvalidResult.StructuredContent);
         }
     }
 

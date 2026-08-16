@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Gargantuan.Mcp.Contracts;
 using Microsoft.Extensions.Logging;
+using ModelContextProtocol.Protocol;
 
 namespace Gargantuan.Mcp.Server;
 
@@ -46,4 +47,15 @@ public sealed class ToolExecutor(ILogger<ToolExecutor> Logger)
     }
 
     private static string Bound(string Message) => Message.Length <= 512 ? Message : Message[..512];
+
+    public static CallToolResult ToMcpResult<T>(ToolResponse<T> Response)
+    {
+        JsonElement StructuredContent = JsonSerializer.SerializeToElement(Response);
+        return new CallToolResult
+        {
+            Content = [new TextContentBlock { Text = StructuredContent.GetRawText() }],
+            StructuredContent = StructuredContent,
+            IsError = !Response.Success,
+        };
+    }
 }

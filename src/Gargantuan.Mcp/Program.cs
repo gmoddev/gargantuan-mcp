@@ -14,15 +14,17 @@ MockGargantuanAdapter Adapter = new();
 Builder.Services.AddSingleton<IGargantuanAdapter>(Adapter);
 Builder.Services.AddSingleton(new LocalToolPolicy(AllowStudioLocalWrite));
 Builder.Services.AddSingleton<ToolExecutor>();
+Builder.Services.AddSingleton<ReadTools>();
+Builder.Services.AddSingleton<StudioTools>();
 
 IMcpServerBuilder McpBuilder = Builder.Services.AddMcpServer(Options => Options.ProtocolVersion = "2026-07-28")
     .WithStdioServerTransport();
 
 AdapterCapability[] ReadCapabilities = [AdapterCapability.ProjectInspection, AdapterCapability.HierarchyInspection, AdapterCapability.SchemaInspection, AdapterCapability.SelectionInspection];
 if (ReadCapabilities.All(Adapter.Descriptor.Capabilities.Contains))
-    McpBuilder.WithTools<ReadTools>();
+    McpBuilder.WithTools<McpReadTools>();
 
 if (AllowStudioLocalWrite && Adapter.Descriptor.Capabilities.Contains(AdapterCapability.SelectionWrite))
-    McpBuilder.WithTools<StudioTools>();
+    McpBuilder.WithTools<McpStudioTools>();
 
 await Builder.Build().RunAsync();
