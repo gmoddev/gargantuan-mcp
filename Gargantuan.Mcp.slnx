@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Gargantuan.Mcp.Contracts/Gargantuan.Mcp.Contracts.csproj" />
+    <Project Path="src/Gargantuan.Mcp.Mock/Gargantuan.Mcp.Mock.csproj" />
+    <Project Path="src/Gargantuan.Mcp/Gargantuan.Mcp.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Gargantuan.Mcp.ContractTests/Gargantuan.Mcp.ContractTests.csproj" />
+    <Project Path="tests/Gargantuan.Mcp.Tests/Gargantuan.Mcp.Tests.csproj" />
+  </Folder>
+</Solution>
