@@ -5,6 +5,25 @@ using ModelContextProtocol.Protocol;
 
 namespace Gargantuan.Mcp.Server;
 
+public static class ToolRegistrationPolicy
+{
+    private static readonly AdapterCapability[] ReadCapabilities =
+    [
+        AdapterCapability.ProjectInspection,
+        AdapterCapability.HierarchyInspection,
+        AdapterCapability.SchemaInspection,
+        AdapterCapability.SelectionInspection,
+    ];
+
+    public static bool CanAdvertiseReadTools(AdapterDescriptor Descriptor, LocalToolPolicy Policy) =>
+        Policy.Evaluate(ToolRiskClass.Read) == PolicyDecision.Allow &&
+        ReadCapabilities.All(Descriptor.Capabilities.Contains);
+
+    public static bool CanAdvertiseSelectionWrite(AdapterDescriptor Descriptor, LocalToolPolicy Policy) =>
+        Policy.Evaluate(ToolRiskClass.StudioLocalWrite) == PolicyDecision.Allow &&
+        Descriptor.Capabilities.Contains(AdapterCapability.SelectionWrite);
+}
+
 public sealed class ReadTools(IGargantuanAdapter Adapter, ToolExecutor Executor)
 {
     public Task<ToolResponse<ProjectInfo>> GetProjectInfo(CancellationToken CancellationToken)

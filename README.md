@@ -2,7 +2,7 @@
 
 An independent, conservative Model Context Protocol server foundation for Gargantuan developer tooling.
 
-> **Foundation 1 status:** this server uses deterministic mock data. It does **not** connect to a live Gargantuan engine or Studio session and it cannot acquire engine authority.
+> **Foundation 2 status:** live project, hierarchy, instance, schema, and Studio-local selection integration is implemented through Studio's authenticated current-user Windows named-pipe bridge. The executable still defaults to deterministic mock data. It never connects directly to EditorHost or the engine and it cannot acquire engine authority.
 
 ## Protocol target
 
@@ -35,7 +35,20 @@ Example client configuration:
 }
 ```
 
-The default policy advertises seven read tools. To opt into the mock-only Studio-local selection write for development, append `--allow-studio-local-write` to the server command. MCP arguments and mock project data cannot change this policy.
+The default executable uses `MockGargantuanAdapter` and advertises seven read tools. To opt into Studio-local selection write in either mode, append `--allow-studio-local-write` to the server command. MCP arguments, request metadata, adapter data, and project data cannot change this policy.
+
+For an explicitly enabled live Studio session, start Studio with its descriptor option, wait for that exact file to be published, and pass the same absolute path to MCP:
+
+```powershell
+GargantuanStudio --engine <engine> --project <project> `
+  --mcp-bridge-descriptor <absolute-LocalApplicationData-session.json>
+
+dotnet Gargantuan.Mcp.dll `
+  --studio-bridge-descriptor <absolute-LocalApplicationData-session.json> `
+  --allow-studio-local-write
+```
+
+Omit `--allow-studio-local-write` to keep `studio.set_selection` out of discovery. MCP reads only the supplied descriptor; it never searches LocalApplicationData or scans processes. One MCP process remains bound to the descriptor's immutable pipe, session ID, and token and never reattaches to a replacement session.
 
 ## Current tools
 
@@ -56,14 +69,15 @@ See [ToolReference.md](devdocs/ToolReference.md) for arguments, results, paginat
 
 MCP client input is untrusted. The server owns policy; client identity is not engine authority. Requests are bounded by page size, recursion depth, search count, response bytes, property/string/query/selection sizes, continuation-token length, and concurrency. Adapter exceptions are confined and converted to stable safe errors. There are no filesystem, shell, process execution, script, Play/Test, network-listener, HTTP, or authentication tools.
 
-Opaque mock identifiers such as `gtn_workspace_part` are adapter-owned handles, not engine `ObjectId` internals and not path identities. A future Studio adapter must map them to stable Gargantuan ObjectId semantics.
+Opaque mock identifiers such as `gtn_workspace_part` are adapter-owned handles, not engine `ObjectId` internals and not path identities. The Studio adapter maps Studio's generation-safe `(Slot, Generation)` identities to session-local opaque `gtn_studio_*` handles without exposing the native representation.
 
 ## Architecture and limitations
 
-MCP translates protocol DTOs into Gargantuan-owned semantic requests on `IGargantuanAdapter`. `MockGargantuanAdapter` is the only implementation today. Future live authoring must route through Studio commands/capabilities, EditorHost, and the authoritative mutation gateway; MCP must never access raw DataModel state or manufacture authority contexts/capabilities.
+MCP translates protocol DTOs into Gargantuan-owned semantic requests on `IGargantuanAdapter`. `MockGargantuanAdapter` remains the default standalone implementation. `StudioGargantuanAdapter` implements project, hierarchy, schema, and selection semantics over `IStudioSessionClient`; `StudioSessionClient` implements Studio's committed descriptor and named-pipe protocol. Studio owns the document/schema/selection services, capability checks, bridge host, and all EditorHost routes. MCP never receives an EditorHost client, raw DataModel state, or authority contexts/capabilities.
 
 - [Current MCP architecture](devdocs/CurrentArchitecture/McpArchitecture.md)
-- [Future Studio integration](devdocs/FutureArchitecture/StudioMcpIntegration.md)
+- [Studio integration status](devdocs/FutureArchitecture/StudioMcpIntegration.md)
+- [Studio-side bridge follow-up contract](devdocs/StudioBridgeContract.md)
 - [Threat model](devdocs/ThreatModel.md)
 
 Resources and prompts were deliberately omitted: Foundation 1's small tool surface already provides the bounded parameterized reads, and duplicating each tool as a resource would add no meaningful abstraction. HTTP and remote hosting are also deliberately absent.

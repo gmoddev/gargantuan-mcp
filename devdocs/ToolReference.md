@@ -1,6 +1,6 @@
 # Tool Reference
 
-The C# tool attributes and generated MCP JSON schemas are canonical. This concise inventory records semantic behavior and is covered by protocol discovery tests.
+The C# tool attributes and generated MCP JSON schemas are canonical. This concise inventory records semantic behavior and is covered by protocol discovery tests. In Studio mode, each capability is negotiated from the Studio-owned session bridge; MCP never infers it from a requested tool.
 
 | Name | Risk | Arguments | Result | Pagination | Capability |
 | --- | --- | --- | --- | --- | --- |
@@ -14,3 +14,5 @@ The C# tool attributes and generated MCP JSON schemas are canonical. This concis
 | `studio.set_selection` | StudioLocalWrite | object ID list | accepted object ID list | no; max 128 | SelectionWrite + local Allow |
 
 Every result uses `ToolResponse<T>`: `{ Success, Result, Error }`. On failure, `Error` contains a stable semantic `Code` and bounded safe `Message`. `project.list_instances` uses case-insensitive substring name matching, exact case-insensitive class matching, an ancestor scope, deterministic depth-then-ID order, maximum depth 8, and at most 1,000 candidates.
+
+The executable defaults to mock mode. `--studio-bridge-descriptor <absolute path>` selects one live Studio session at startup and supports exactly this tool set when negotiated capabilities and local policy permit it. `studio.set_selection` always requires both `SelectionWrite` from Studio and local `StudioLocalWrite = Allow`; MCP request metadata cannot satisfy either condition. The client never changes adapters or reattaches during the MCP process lifetime.
