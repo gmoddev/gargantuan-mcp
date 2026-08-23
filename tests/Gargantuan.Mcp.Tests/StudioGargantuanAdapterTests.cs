@@ -2,6 +2,7 @@ using Gargantuan.Mcp.Contracts;
 using Gargantuan.Mcp.Server;
 using Gargantuan.Mcp.Studio;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Text.Json;
 
 namespace Gargantuan.Mcp.Tests;
 
@@ -126,6 +127,9 @@ public sealed class StudioGargantuanAdapterTests
     [InlineData(StudioBridgeErrorCode.Unavailable, GargantuanErrorCode.Unavailable)]
     [InlineData(StudioBridgeErrorCode.Conflict, GargantuanErrorCode.Conflict)]
     [InlineData(StudioBridgeErrorCode.CapabilityUnavailable, GargantuanErrorCode.CapabilityUnavailable)]
+    [InlineData(StudioBridgeErrorCode.CommandUnavailable, GargantuanErrorCode.CommandUnavailable)]
+    [InlineData(StudioBridgeErrorCode.ValidationFailed, GargantuanErrorCode.ValidationFailed)]
+    [InlineData(StudioBridgeErrorCode.Cancelled, GargantuanErrorCode.Cancelled)]
     public async Task KnownBridgeFailuresMapToStableErrors(StudioBridgeErrorCode BridgeCode, GargantuanErrorCode AdapterCode)
     {
         FakeStudioSessionClient Client = new(FakeStudioSessionClient.AllCapabilities)
@@ -180,6 +184,110 @@ public sealed class StudioGargantuanAdapterTests
     }
 
     [Fact]
+    public async Task ProjectWriteUsesTypedBridgeRequestAndReturnsOpaqueAuthoritativeIdentity()
+    {
+        FakeStudioSessionClient Client = new(FakeStudioSessionClient.AllCapabilities);
+        StudioGargantuanAdapter Adapter = await StudioGargantuanAdapter.CreateAsync(Client);
+        ProjectInfo Project = await Adapter.GetProjectInfoAsync(default);
+        InitialPropertyWrite[] InitialProperties =
+        [
+            new(new(ProjectPropertyKind.Native, "Name"),
+                new("String", JsonSerializer.SerializeToElement("MCP Folder"))),
+        ];
+
+        ProjectWriteResult Result = await Adapter.CreateInstanceAsync(
+            new("Folder", Project.RootId, InitialProperties, 17), default);
+
+        Assert.NotNull(Result.ObjectId);
+        Assert.StartsWith("gtn_studio_", Result.ObjectId.Value.Value, StringComparison.Ordinal);
+        Assert.DoesNotContain("10:2", Result.ObjectId.Value.Value, StringComparison.Ordinal);
+        Assert.Equal(18, Result.Revision);
+        Assert.Equal(17, Client.LastCreateRequest?.ExpectedRevision);
+        Assert.Equal(new StudioObjectIdentity(1, 7), Client.LastCreateRequest?.ParentId);
+        Assert.Equal("Name", Client.LastCreateRequest?.InitialProperties.Single().Property.Name);
+        Assert.Equal("MCP Folder", Client.LastCreateRequest?.InitialProperties.Single().Value.Value?.GetString());
+        Assert.Equal(1, Client.ProjectWriteCalls);
+    }
+
+    [Fact]
+    public async Task ProjectWriteValidationRejectsBeforeBridgeInvocation()
+    {
+        FakeStudioSessionClient Client = new(FakeStudioSessionClient.AllCapabilities);
+        StudioGargantuanAdapter Adapter = await StudioGargantuanAdapter.CreateAsync(Client);
+        ProjectInfo Project = await Adapter.GetProjectInfoAsync(default);
+
+        GargantuanAdapterException Revision = await Assert.ThrowsAsync<GargantuanAdapterException>(() =>
+            Adapter.SaveProjectAsync(new(0), default));
+        Assert.Equal(GargantuanErrorCode.InvalidArgument, Revision.Code);
+
+        GargantuanAdapterException DeleteAcknowledgement = await Assert.ThrowsAsync<GargantuanAdapterException>(() =>
+            Adapter.DeleteInstanceAsync(new(Project.RootId, false, null), default));
+        Assert.Equal(GargantuanErrorCode.InvalidArgument, DeleteAcknowledgement.Code);
+
+        ProjectPropertyValue NonFinite = new("Double", JsonDocument.Parse("1e9999").RootElement.Clone());
+        GargantuanAdapterException Value = await Assert.ThrowsAsync<GargantuanAdapterException>(() =>
+            Adapter.SetPropertyAsync(new(Project.RootId, new(ProjectPropertyKind.Native, "Name"), NonFinite, null), default));
+        Assert.Equal(GargantuanErrorCode.InvalidArgument, Value.Code);
+
+        Assert.Equal(0, Client.ProjectWriteCalls);
+    }
+
+    [Fact]
+    public async Task ProjectWritePolicyDeniesBeforeBridgeAndBoundsConcurrency()
+    {
+        FakeStudioSessionClient Client = new(FakeStudioSessionClient.AllCapabilities);
+        StudioGargantuanAdapter Adapter = await StudioGargantuanAdapter.CreateAsync(Client);
+        ToolExecutor Executor = new(NullLogger<ToolExecutor>.Instance);
+
+        ProjectWriteTools DeniedTools = new(Adapter, Executor, new LocalToolPolicy());
+        ToolResponse<ProjectWriteResult> Denied = await DeniedTools.Save();
+        Assert.Equal(nameof(GargantuanErrorCode.PermissionDenied), Denied.Error?.Code);
+        Assert.Equal(0, Client.ProjectWriteCalls);
+
+        TaskCompletionSource Entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource Release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Client.SaveOperation = async CancellationToken =>
+        {
+            Entered.SetResult();
+            await Release.Task.WaitAsync(CancellationToken);
+            return FakeStudioSessionClient.SuccessfulWrite;
+        };
+        ProjectWriteTools AllowedTools = new(Adapter, Executor, new LocalToolPolicy(AllowProjectWrite: true));
+        Task<ToolResponse<ProjectWriteResult>> First = AllowedTools.Save();
+        await Entered.Task;
+        ToolResponse<ProjectWriteResult> Concurrent = await AllowedTools.Undo();
+        Assert.Equal(nameof(GargantuanErrorCode.ResourceLimit), Concurrent.Error?.Code);
+        Release.SetResult();
+        Assert.True((await First).Success);
+        Assert.Equal(1, Client.ProjectWriteCalls);
+    }
+
+    [Fact]
+    public async Task ProjectWriteCancellationAndStaleIdentityArePreserved()
+    {
+        FakeStudioSessionClient Client = new(FakeStudioSessionClient.AllCapabilities)
+        {
+            SaveOperation = async CancellationToken =>
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, CancellationToken);
+                throw new InvalidOperationException("Unreachable");
+            },
+        };
+        StudioGargantuanAdapter Adapter = await StudioGargantuanAdapter.CreateAsync(Client);
+        using CancellationTokenSource Cancellation = new();
+        Task<ProjectWriteResult> Pending = Adapter.SaveProjectAsync(new(null), Cancellation.Token);
+        Cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Pending);
+
+        Client.SaveOperation = null;
+        Client.ProjectWriteFailure = new StudioBridgeException(
+            StudioBridgeErrorCode.StaleIdentity, "The object generation is stale.");
+        GargantuanAdapterException Stale = await Assert.ThrowsAsync<GargantuanAdapterException>(() =>
+            Adapter.SaveProjectAsync(new(null), default));
+        Assert.Equal(GargantuanErrorCode.StaleIdentity, Stale.Code);
+    }
+
+    [Fact]
     public void ToolAdvertisementRequiresBothServerPolicyAndAdapterCapability()
     {
         AdapterDescriptor ReadOnly = new("Studio", "1", new HashSet<AdapterCapability>
@@ -193,11 +301,18 @@ public sealed class StudioGargantuanAdapterTests
         {
             Capabilities = new HashSet<AdapterCapability>(ReadOnly.Capabilities) { AdapterCapability.SelectionWrite },
         };
+        AdapterDescriptor ProjectWritable = ReadOnly with
+        {
+            Capabilities = new HashSet<AdapterCapability>(ReadOnly.Capabilities) { AdapterCapability.ProjectWrite },
+        };
 
         Assert.True(ToolRegistrationPolicy.CanAdvertiseReadTools(ReadOnly, new LocalToolPolicy()));
         Assert.False(ToolRegistrationPolicy.CanAdvertiseSelectionWrite(ReadOnly, new LocalToolPolicy(true)));
         Assert.False(ToolRegistrationPolicy.CanAdvertiseSelectionWrite(Writable, new LocalToolPolicy()));
         Assert.True(ToolRegistrationPolicy.CanAdvertiseSelectionWrite(Writable, new LocalToolPolicy(true)));
+        Assert.False(ToolRegistrationPolicy.CanAdvertiseProjectWrite(ReadOnly, new LocalToolPolicy(AllowProjectWrite: true)));
+        Assert.False(ToolRegistrationPolicy.CanAdvertiseProjectWrite(ProjectWritable, new LocalToolPolicy()));
+        Assert.True(ToolRegistrationPolicy.CanAdvertiseProjectWrite(ProjectWritable, new LocalToolPolicy(AllowProjectWrite: true)));
     }
 
     private sealed class FakeStudioSessionClient : IStudioSessionClient
@@ -215,6 +330,8 @@ public sealed class StudioGargantuanAdapterTests
 
         public static IReadOnlySet<StudioBridgeCapability> AllCapabilities { get; } =
             new HashSet<StudioBridgeCapability>(Enum.GetValues<StudioBridgeCapability>());
+        public static StudioProjectWriteResult SuccessfulWrite { get; } =
+            new(new StudioObjectIdentity(10, 2), 18, 16, true, "MCP write", []);
 
         public FakeStudioSessionClient(IReadOnlySet<StudioBridgeCapability> Capabilities)
         {
@@ -230,7 +347,11 @@ public sealed class StudioGargantuanAdapterTests
         public ulong SnapshotVersion { get; set; } = 41;
         public int GetSelectionCalls { get; private set; }
         public int SetSelectionCalls { get; private set; }
+        public int ProjectWriteCalls { get; private set; }
         public IReadOnlyList<StudioObjectIdentity> Selection { get; set; } = [RootId];
+        public StudioCreateInstanceRequest? LastCreateRequest { get; private set; }
+        public Exception? ProjectWriteFailure { get; set; }
+        public Func<CancellationToken, Task<StudioProjectWriteResult>>? SaveOperation { get; set; }
 
         public Task<StudioSessionDescriptor> DescribeSessionAsync(CancellationToken CancellationToken)
         {
@@ -312,6 +433,48 @@ public sealed class StudioGargantuanAdapterTests
             SetSelectionCalls++;
             Selection = NewSelection.ToArray();
             return Task.FromResult(Selection);
+        }
+
+        public Task<StudioProjectWriteResult> CreateInstanceAsync(StudioCreateInstanceRequest Request, CancellationToken CancellationToken)
+        {
+            LastCreateRequest = Request;
+            return CompleteWriteAsync(CancellationToken);
+        }
+
+        public Task<StudioProjectWriteResult> DeleteInstanceAsync(StudioDeleteInstanceRequest Request, CancellationToken CancellationToken) =>
+            CompleteWriteAsync(CancellationToken);
+
+        public Task<StudioProjectWriteResult> DuplicateInstanceAsync(StudioDuplicateInstanceRequest Request, CancellationToken CancellationToken) =>
+            CompleteWriteAsync(CancellationToken);
+
+        public Task<StudioProjectWriteResult> ReparentInstanceAsync(StudioReparentInstanceRequest Request, CancellationToken CancellationToken) =>
+            CompleteWriteAsync(CancellationToken);
+
+        public Task<StudioProjectWriteResult> SetPropertyAsync(StudioSetPropertyRequest Request, CancellationToken CancellationToken) =>
+            CompleteWriteAsync(CancellationToken);
+
+        public Task<StudioProjectWriteResult> SaveProjectAsync(StudioProjectRevisionRequest Request, CancellationToken CancellationToken)
+        {
+            ProjectWriteCalls++;
+            CancellationToken.ThrowIfCancellationRequested();
+            if (ProjectWriteFailure is not null)
+                return Task.FromException<StudioProjectWriteResult>(ProjectWriteFailure);
+            return SaveOperation?.Invoke(CancellationToken) ?? Task.FromResult(SuccessfulWrite);
+        }
+
+        public Task<StudioProjectWriteResult> UndoAsync(StudioProjectRevisionRequest Request, CancellationToken CancellationToken) =>
+            CompleteWriteAsync(CancellationToken);
+
+        public Task<StudioProjectWriteResult> RedoAsync(StudioProjectRevisionRequest Request, CancellationToken CancellationToken) =>
+            CompleteWriteAsync(CancellationToken);
+
+        private Task<StudioProjectWriteResult> CompleteWriteAsync(CancellationToken CancellationToken)
+        {
+            ProjectWriteCalls++;
+            CancellationToken.ThrowIfCancellationRequested();
+            return ProjectWriteFailure is null
+                ? Task.FromResult(SuccessfulWrite)
+                : Task.FromException<StudioProjectWriteResult>(ProjectWriteFailure);
         }
 
         private static StudioInstanceDetails Instance(StudioObjectIdentity Id, string Name, string ClassName, StudioObjectIdentity? ParentId) =>

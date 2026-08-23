@@ -110,6 +110,38 @@ public sealed class MockGargantuanAdapter : IGargantuanAdapter
         return Task.FromResult<IReadOnlyList<ObjectIdentity>>(NewSelection.ToArray());
     }
 
+    public Task<ProjectWriteResult> CreateInstanceAsync(CreateInstanceRequest Request, CancellationToken CancellationToken) =>
+        UnsupportedProjectWrite<ProjectWriteResult>(CancellationToken);
+
+    public Task<ProjectWriteResult> DeleteInstanceAsync(DeleteInstanceRequest Request, CancellationToken CancellationToken) =>
+        UnsupportedProjectWrite<ProjectWriteResult>(CancellationToken);
+
+    public Task<ProjectWriteResult> DuplicateInstanceAsync(DuplicateInstanceRequest Request, CancellationToken CancellationToken) =>
+        UnsupportedProjectWrite<ProjectWriteResult>(CancellationToken);
+
+    public Task<ProjectWriteResult> ReparentInstanceAsync(ReparentInstanceRequest Request, CancellationToken CancellationToken) =>
+        UnsupportedProjectWrite<ProjectWriteResult>(CancellationToken);
+
+    public Task<ProjectWriteResult> SetPropertyAsync(SetPropertyRequest Request, CancellationToken CancellationToken) =>
+        UnsupportedProjectWrite<ProjectWriteResult>(CancellationToken);
+
+    public Task<ProjectWriteResult> SaveProjectAsync(ProjectRevisionRequest Request, CancellationToken CancellationToken) =>
+        UnsupportedProjectWrite<ProjectWriteResult>(CancellationToken);
+
+    public Task<ProjectWriteResult> UndoAsync(ProjectRevisionRequest Request, CancellationToken CancellationToken) =>
+        UnsupportedProjectWrite<ProjectWriteResult>(CancellationToken);
+
+    public Task<ProjectWriteResult> RedoAsync(ProjectRevisionRequest Request, CancellationToken CancellationToken) =>
+        UnsupportedProjectWrite<ProjectWriteResult>(CancellationToken);
+
+    private static Task<T> UnsupportedProjectWrite<T>(CancellationToken CancellationToken)
+    {
+        CancellationToken.ThrowIfCancellationRequested();
+        return Task.FromException<T>(Error(
+            GargantuanErrorCode.CapabilityUnavailable,
+            "The deterministic mock does not provide ProjectWrite."));
+    }
+
     private void Walk(ObjectIdentity ParentId, int Depth, int MaximumDepth, List<InstanceSummary> Results)
     {
         if (Depth > MaximumDepth) return;

@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using Gargantuan.Mcp.Contracts;
 
 namespace Gargantuan.Mcp.Studio;
@@ -34,6 +35,7 @@ public sealed class StudioGargantuanAdapter : IGargantuanAdapter
                 StudioBridgeCapability.SchemaInspection => AdapterCapability.SchemaInspection,
                 StudioBridgeCapability.SelectionInspection => AdapterCapability.SelectionInspection,
                 StudioBridgeCapability.SelectionWrite => AdapterCapability.SelectionWrite,
+                StudioBridgeCapability.ProjectWrite => AdapterCapability.ProjectWrite,
                 _ => throw new GargantuanAdapterException(GargantuanErrorCode.InternalError, "Studio advertised an unsupported capability."),
             });
         }
@@ -200,6 +202,257 @@ public sealed class StudioGargantuanAdapter : IGargantuanAdapter
             AdapterCapability.SelectionWrite,
             async () => ConvertSelection(await Client.SetSelectionAsync(StudioSelection, CancellationToken).ConfigureAwait(false)),
             CancellationToken);
+    }
+
+    public Task<ProjectWriteResult> CreateInstanceAsync(CreateInstanceRequest Request, CancellationToken CancellationToken)
+    {
+        RequireCapability(AdapterCapability.ProjectWrite);
+        ValidateExpectedRevision(Request.ExpectedRevision);
+        ValidateClassId(Request.ClassId);
+        if (Request.InitialProperties.Count > McpLimits.MaximumInitialPropertyCount)
+            throw Error(GargantuanErrorCode.ResourceLimit,
+                $"Create initialization exceeds {McpLimits.MaximumInitialPropertyCount} properties.");
+        StudioInitialPropertyWrite[] InitialProperties = Request.InitialProperties
+            .Select(ConvertInitialProperty).ToArray();
+        if (InitialProperties.Select(Item => Item.Property).Distinct().Count() != InitialProperties.Length)
+            throw Error(GargantuanErrorCode.InvalidArgument, "Create initialization contains duplicate properties.");
+        StudioCreateInstanceRequest BridgeRequest = new(
+            Request.ClassId,
+            Identities.GetStudioIdentity(Request.ParentId),
+            InitialProperties,
+            Request.ExpectedRevision);
+        ValidateWriteRequestSize(BridgeRequest);
+        return InvokeWriteAsync(
+            () => Client.CreateInstanceAsync(BridgeRequest, CancellationToken), CancellationToken);
+    }
+
+    public Task<ProjectWriteResult> DeleteInstanceAsync(DeleteInstanceRequest Request, CancellationToken CancellationToken)
+    {
+        RequireCapability(AdapterCapability.ProjectWrite);
+        ValidateExpectedRevision(Request.ExpectedRevision);
+        if (!Request.DeleteSubtree)
+            throw Error(GargantuanErrorCode.InvalidArgument,
+                "DeleteSubtree must be true to acknowledge that the target and all descendants will be deleted.");
+        StudioDeleteInstanceRequest BridgeRequest = new(
+            Identities.GetStudioIdentity(Request.ObjectId), true, Request.ExpectedRevision);
+        return InvokeWriteAsync(
+            () => Client.DeleteInstanceAsync(BridgeRequest, CancellationToken), CancellationToken);
+    }
+
+    public Task<ProjectWriteResult> DuplicateInstanceAsync(DuplicateInstanceRequest Request, CancellationToken CancellationToken)
+    {
+        RequireCapability(AdapterCapability.ProjectWrite);
+        ValidateExpectedRevision(Request.ExpectedRevision);
+        StudioDuplicateInstanceRequest BridgeRequest = new(
+            Identities.GetStudioIdentity(Request.ObjectId), Request.ExpectedRevision);
+        return InvokeWriteAsync(
+            () => Client.DuplicateInstanceAsync(BridgeRequest, CancellationToken), CancellationToken);
+    }
+
+    public Task<ProjectWriteResult> ReparentInstanceAsync(ReparentInstanceRequest Request, CancellationToken CancellationToken)
+    {
+        RequireCapability(AdapterCapability.ProjectWrite);
+        ValidateExpectedRevision(Request.ExpectedRevision);
+        StudioReparentInstanceRequest BridgeRequest = new(
+            Identities.GetStudioIdentity(Request.ObjectId),
+            Identities.GetStudioIdentity(Request.ParentId),
+            Request.ExpectedRevision);
+        return InvokeWriteAsync(
+            () => Client.ReparentInstanceAsync(BridgeRequest, CancellationToken), CancellationToken);
+    }
+
+    public Task<ProjectWriteResult> SetPropertyAsync(SetPropertyRequest Request, CancellationToken CancellationToken)
+    {
+        RequireCapability(AdapterCapability.ProjectWrite);
+        ValidateExpectedRevision(Request.ExpectedRevision);
+        StudioSetPropertyRequest BridgeRequest = new(
+            Identities.GetStudioIdentity(Request.ObjectId),
+            ConvertPropertyTarget(Request.Property),
+            ConvertPropertyValue(Request.Value),
+            Request.ExpectedRevision);
+        ValidateWriteRequestSize(BridgeRequest);
+        return InvokeWriteAsync(
+            () => Client.SetPropertyAsync(BridgeRequest, CancellationToken), CancellationToken);
+    }
+
+    public Task<ProjectWriteResult> SaveProjectAsync(ProjectRevisionRequest Request, CancellationToken CancellationToken) =>
+        InvokeRevisionWriteAsync(Request, Client.SaveProjectAsync, CancellationToken);
+
+    public Task<ProjectWriteResult> UndoAsync(ProjectRevisionRequest Request, CancellationToken CancellationToken) =>
+        InvokeRevisionWriteAsync(Request, Client.UndoAsync, CancellationToken);
+
+    public Task<ProjectWriteResult> RedoAsync(ProjectRevisionRequest Request, CancellationToken CancellationToken) =>
+        InvokeRevisionWriteAsync(Request, Client.RedoAsync, CancellationToken);
+
+    private Task<ProjectWriteResult> InvokeRevisionWriteAsync(
+        ProjectRevisionRequest Request,
+        Func<StudioProjectRevisionRequest, CancellationToken, Task<StudioProjectWriteResult>> Operation,
+        CancellationToken CancellationToken)
+    {
+        RequireCapability(AdapterCapability.ProjectWrite);
+        ValidateExpectedRevision(Request.ExpectedRevision);
+        StudioProjectRevisionRequest BridgeRequest = new(Request.ExpectedRevision);
+        return InvokeWriteAsync(() => Operation(BridgeRequest, CancellationToken), CancellationToken);
+    }
+
+    private Task<ProjectWriteResult> InvokeWriteAsync(
+        Func<Task<StudioProjectWriteResult>> Operation,
+        CancellationToken CancellationToken) => InvokeAsync(
+        AdapterCapability.ProjectWrite,
+        async () => ConvertWriteResult(await Operation().ConfigureAwait(false)),
+        CancellationToken);
+
+    private ProjectWriteResult ConvertWriteResult(StudioProjectWriteResult Result)
+    {
+        if (Result.Revision < 0 || Result.PersistedRevision < 0 || Result.Diagnostics is null ||
+            Result.Diagnostics.Count > McpLimits.MaximumWriteDiagnostics)
+            throw BridgeContractError("Studio returned an invalid ProjectWrite result.");
+        if (Result.ObjectId is { } Object) ValidateNativeIdentity(Object);
+        ProjectWriteDiagnostic[] Diagnostics = Result.Diagnostics.Select(Item => new ProjectWriteDiagnostic(
+            RequireBridgeString(Item.Code, nameof(Item.Code)),
+            RequireBridgeString(Item.Message, nameof(Item.Message)))).ToArray();
+        return new ProjectWriteResult(
+            Result.ObjectId is { } ObjectId ? Identities.GetMcpIdentity(ObjectId) : null,
+            Result.Revision,
+            Result.PersistedRevision,
+            Result.Dirty,
+            OptionalBridgeString(Result.HistoryLabel, nameof(Result.HistoryLabel)),
+            Diagnostics);
+    }
+
+    private StudioInitialPropertyWrite ConvertInitialProperty(InitialPropertyWrite Item) => new(
+        ConvertPropertyTarget(Item.Property), ConvertPropertyValue(Item.Value));
+
+    private static StudioProjectPropertyTarget ConvertPropertyTarget(ProjectPropertyTarget Property)
+    {
+        if (Property is null)
+            throw Error(GargantuanErrorCode.InvalidArgument, "Property target is required.");
+        string Name = RequireInputString(Property.Name, "Property name", 256);
+        string? DeclaringSchemaId = Property.DeclaringSchemaId is null
+            ? null
+            : RequireInputString(Property.DeclaringSchemaId, "Declaring schema identity", McpLimits.MaximumStringLength);
+        if (Property.Kind == ProjectPropertyKind.Native && DeclaringSchemaId is not null ||
+            Property.Kind is ProjectPropertyKind.Custom or ProjectPropertyKind.Extension && DeclaringSchemaId is null)
+            throw Error(GargantuanErrorCode.InvalidArgument,
+                "Native properties omit DeclaringSchemaId; custom and extension properties require it.");
+        return new StudioProjectPropertyTarget(
+            Property.Kind switch
+            {
+                ProjectPropertyKind.Native => StudioProjectPropertyKind.Native,
+                ProjectPropertyKind.Custom => StudioProjectPropertyKind.Custom,
+                ProjectPropertyKind.Extension => StudioProjectPropertyKind.Extension,
+                _ => throw Error(GargantuanErrorCode.InvalidArgument, "Property kind is invalid."),
+            },
+            Name,
+            DeclaringSchemaId);
+    }
+
+    private StudioProjectPropertyValue ConvertPropertyValue(ProjectPropertyValue Input)
+    {
+        if (Input is null)
+            throw Error(GargantuanErrorCode.InvalidArgument, "Property value is required.");
+        string Type = RequireInputString(Input.Type, "Property value type", 32);
+        JsonElement? Value = Input.Value;
+        string? Enum = Input.Enum;
+        string? SchemaId = Input.SchemaId;
+        uint? DefinitionVersion = Input.DefinitionVersion;
+        StudioObjectIdentity? Object = Input.Object is { } ObjectId ? Identities.GetStudioIdentity(ObjectId) : null;
+
+        switch (Type)
+        {
+            case "Null":
+                RequireValueShape(Value is null, Enum is null && SchemaId is null && DefinitionVersion is null && Object is null);
+                break;
+            case "Bool":
+                RequireValueShape(Value?.ValueKind is JsonValueKind.True or JsonValueKind.False,
+                    Enum is null && SchemaId is null && DefinitionVersion is null && Object is null);
+                break;
+            case "Int":
+                RequireValueShape(Value is { } Integer && Integer.TryGetInt32(out _),
+                    Enum is null && SchemaId is null && DefinitionVersion is null && Object is null);
+                break;
+            case "Float":
+            case "Double":
+                RequireValueShape(Value is { ValueKind: JsonValueKind.Number } Number &&
+                    Number.TryGetDouble(out double Scalar) && double.IsFinite(Scalar),
+                    Enum is null && SchemaId is null && DefinitionVersion is null && Object is null);
+                break;
+            case "String":
+                RequireValueShape(Value is { ValueKind: JsonValueKind.String } Text &&
+                    Encoding.UTF8.GetByteCount(Text.GetString() ?? string.Empty) <= McpLimits.MaximumPropertyStringBytes,
+                    Enum is null && SchemaId is null && DefinitionVersion is null && Object is null);
+                break;
+            case "Vector2": ValidateComponents(Value, 2, false); RequireNoValueIdentity(Enum, SchemaId, DefinitionVersion, Object); break;
+            case "Vector3": ValidateComponents(Value, 3, false); RequireNoValueIdentity(Enum, SchemaId, DefinitionVersion, Object); break;
+            case "Color3": ValidateComponents(Value, 3, false); RequireNoValueIdentity(Enum, SchemaId, DefinitionVersion, Object); break;
+            case "UDim": ValidateComponents(Value, 2, true); RequireNoValueIdentity(Enum, SchemaId, DefinitionVersion, Object); break;
+            case "UDim2": ValidateComponents(Value, 4, true); RequireNoValueIdentity(Enum, SchemaId, DefinitionVersion, Object); break;
+            case "CFrame": ValidateComponents(Value, 12, false); RequireNoValueIdentity(Enum, SchemaId, DefinitionVersion, Object); break;
+            case "EnumItem":
+                RequireValueShape(Value is { ValueKind: JsonValueKind.String } &&
+                    !string.IsNullOrWhiteSpace(Enum), SchemaId is null && DefinitionVersion is null && Object is null);
+                Enum = RequireInputString(Enum!, "Native enum identity", McpLimits.MaximumStringLength);
+                break;
+            case "SchemaEnum":
+                RequireValueShape(Value is { } EnumValue && EnumValue.TryGetInt32(out _) &&
+                    !string.IsNullOrWhiteSpace(SchemaId) && DefinitionVersion is > 0,
+                    Enum is null && Object is null);
+                SchemaId = RequireInputString(SchemaId!, "Schema enum identity", McpLimits.MaximumStringLength);
+                break;
+            case "ObjectReference":
+                RequireValueShape(Value is null && Object is not null,
+                    Enum is null && SchemaId is null && DefinitionVersion is null);
+                break;
+            default:
+                throw Error(GargantuanErrorCode.InvalidArgument, "Property value Type is unsupported.");
+        }
+
+        return new StudioProjectPropertyValue(Type, Value, Enum, SchemaId, DefinitionVersion, Object);
+    }
+
+    private static void ValidateComponents(JsonElement? Value, int Count, bool IntegralOffsets)
+    {
+        if (Value is not { ValueKind: JsonValueKind.Array } Components || Components.GetArrayLength() != Count)
+            throw Error(GargantuanErrorCode.InvalidArgument, "Property component array has the wrong size.");
+        int Index = 0;
+        foreach (JsonElement Component in Components.EnumerateArray())
+        {
+            bool Valid = IntegralOffsets && Index % 2 == 1
+                ? Component.TryGetInt32(out _)
+                : Component.ValueKind == JsonValueKind.Number && Component.TryGetDouble(out double Number) && double.IsFinite(Number);
+            if (!Valid)
+                throw Error(GargantuanErrorCode.InvalidArgument, "Property components must be finite numbers with integer UDim offsets.");
+            Index++;
+        }
+    }
+
+    private static void RequireNoValueIdentity(
+        string? Enum, string? SchemaId, uint? DefinitionVersion, StudioObjectIdentity? Object) =>
+        RequireValueShape(true, Enum is null && SchemaId is null && DefinitionVersion is null && Object is null);
+
+    private static void RequireValueShape(bool ValueValid, bool IdentityValid)
+    {
+        if (!ValueValid || !IdentityValid)
+            throw Error(GargantuanErrorCode.InvalidArgument, "Property value fields do not match its Type.");
+    }
+
+    private static string RequireInputString(string Value, string Name, int MaximumBytes)
+    {
+        if (string.IsNullOrWhiteSpace(Value) || Encoding.UTF8.GetByteCount(Value) > MaximumBytes)
+            throw Error(GargantuanErrorCode.InvalidArgument, $"{Name} is invalid or exceeds its UTF-8 byte bound.");
+        return Value;
+    }
+
+    private static void ValidateExpectedRevision(long? ExpectedRevision)
+    {
+        if (ExpectedRevision is <= 0)
+            throw Error(GargantuanErrorCode.InvalidArgument, "ExpectedRevision must be a positive project revision.");
+    }
+
+    private static void ValidateWriteRequestSize<T>(T Request)
+    {
+        if (JsonSerializer.SerializeToUtf8Bytes(Request).Length > McpLimits.MaximumProjectWriteRequestBytes)
+            throw Error(GargantuanErrorCode.ResourceLimit, "ProjectWrite request exceeds its encoded byte bound.");
     }
 
     private async Task<T> InvokeAsync<T>(AdapterCapability Capability, Func<Task<T>> Operation, CancellationToken CancellationToken)
@@ -409,7 +662,10 @@ public sealed class StudioGargantuanAdapter : IGargantuanAdapter
             StudioBridgeErrorCode.Conflict => GargantuanErrorCode.Conflict,
             StudioBridgeErrorCode.StaleIdentity => GargantuanErrorCode.StaleIdentity,
             StudioBridgeErrorCode.CapabilityUnavailable => GargantuanErrorCode.CapabilityUnavailable,
+            StudioBridgeErrorCode.CommandUnavailable => GargantuanErrorCode.CommandUnavailable,
+            StudioBridgeErrorCode.ValidationFailed => GargantuanErrorCode.ValidationFailed,
             StudioBridgeErrorCode.ResourceLimit => GargantuanErrorCode.ResourceLimit,
+            StudioBridgeErrorCode.Cancelled => GargantuanErrorCode.Cancelled,
             StudioBridgeErrorCode.InternalError => GargantuanErrorCode.InternalError,
             _ => GargantuanErrorCode.InternalError,
         };

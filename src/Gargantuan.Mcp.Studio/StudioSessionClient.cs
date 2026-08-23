@@ -130,6 +130,56 @@ public sealed class StudioSessionClient : IStudioSessionClient, IAsyncDisposable
         return await InvokeAsync<StudioObjectIdentity[]>("SetSelection", new JsonObject { ["Selection"] = Encoded }, CancellationToken).ConfigureAwait(false);
     }
 
+    public Task<StudioProjectWriteResult> CreateInstanceAsync(StudioCreateInstanceRequest Request, CancellationToken CancellationToken) =>
+        InvokeAsync<StudioProjectWriteResult>("CreateInstance", new JsonObject
+        {
+            ["ClassId"] = Request.ClassId,
+            ["ParentId"] = Identity(Request.ParentId),
+            ["InitialProperties"] = new JsonArray(Request.InitialProperties.Select(InitialProperty).ToArray()),
+            ["ExpectedRevision"] = Request.ExpectedRevision,
+        }, CancellationToken);
+
+    public Task<StudioProjectWriteResult> DeleteInstanceAsync(StudioDeleteInstanceRequest Request, CancellationToken CancellationToken) =>
+        InvokeAsync<StudioProjectWriteResult>("DeleteInstance", new JsonObject
+        {
+            ["ObjectId"] = Identity(Request.ObjectId),
+            ["DeleteSubtree"] = Request.DeleteSubtree,
+            ["ExpectedRevision"] = Request.ExpectedRevision,
+        }, CancellationToken);
+
+    public Task<StudioProjectWriteResult> DuplicateInstanceAsync(StudioDuplicateInstanceRequest Request, CancellationToken CancellationToken) =>
+        InvokeAsync<StudioProjectWriteResult>("DuplicateInstance", new JsonObject
+        {
+            ["ObjectId"] = Identity(Request.ObjectId),
+            ["ExpectedRevision"] = Request.ExpectedRevision,
+        }, CancellationToken);
+
+    public Task<StudioProjectWriteResult> ReparentInstanceAsync(StudioReparentInstanceRequest Request, CancellationToken CancellationToken) =>
+        InvokeAsync<StudioProjectWriteResult>("ReparentInstance", new JsonObject
+        {
+            ["ObjectId"] = Identity(Request.ObjectId),
+            ["ParentId"] = Identity(Request.ParentId),
+            ["ExpectedRevision"] = Request.ExpectedRevision,
+        }, CancellationToken);
+
+    public Task<StudioProjectWriteResult> SetPropertyAsync(StudioSetPropertyRequest Request, CancellationToken CancellationToken) =>
+        InvokeAsync<StudioProjectWriteResult>("SetProperty", new JsonObject
+        {
+            ["ObjectId"] = Identity(Request.ObjectId),
+            ["Property"] = PropertyTarget(Request.Property),
+            ["Value"] = PropertyValue(Request.Value),
+            ["ExpectedRevision"] = Request.ExpectedRevision,
+        }, CancellationToken);
+
+    public Task<StudioProjectWriteResult> SaveProjectAsync(StudioProjectRevisionRequest Request, CancellationToken CancellationToken) =>
+        InvokeAsync<StudioProjectWriteResult>("SaveProject", RevisionParameters(Request), CancellationToken);
+
+    public Task<StudioProjectWriteResult> UndoAsync(StudioProjectRevisionRequest Request, CancellationToken CancellationToken) =>
+        InvokeAsync<StudioProjectWriteResult>("Undo", RevisionParameters(Request), CancellationToken);
+
+    public Task<StudioProjectWriteResult> RedoAsync(StudioProjectRevisionRequest Request, CancellationToken CancellationToken) =>
+        InvokeAsync<StudioProjectWriteResult>("Redo", RevisionParameters(Request), CancellationToken);
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref Disposed, 1) != 0) return;
@@ -402,6 +452,34 @@ public sealed class StudioSessionClient : IStudioSessionClient, IAsyncDisposable
     {
         ["Slot"] = Id.Slot,
         ["Generation"] = Id.Generation,
+    };
+
+    private static JsonObject InitialProperty(StudioInitialPropertyWrite Item) => new()
+    {
+        ["Property"] = PropertyTarget(Item.Property),
+        ["Value"] = PropertyValue(Item.Value),
+    };
+
+    private static JsonObject PropertyTarget(StudioProjectPropertyTarget Property) => new()
+    {
+        ["Kind"] = Property.Kind.ToString(),
+        ["Name"] = Property.Name,
+        ["DeclaringSchemaId"] = Property.DeclaringSchemaId,
+    };
+
+    private static JsonObject PropertyValue(StudioProjectPropertyValue Value) => new()
+    {
+        ["Type"] = Value.Type,
+        ["Value"] = Value.Value is { } Payload ? JsonNode.Parse(Payload.GetRawText()) : null,
+        ["Enum"] = Value.Enum,
+        ["SchemaId"] = Value.SchemaId,
+        ["DefinitionVersion"] = Value.DefinitionVersion,
+        ["Object"] = Value.Object is { } Object ? Identity(Object) : null,
+    };
+
+    private static JsonObject RevisionParameters(StudioProjectRevisionRequest Request) => new()
+    {
+        ["ExpectedRevision"] = Request.ExpectedRevision,
     };
 
     private static string BoundSafeMessage(string? Message)

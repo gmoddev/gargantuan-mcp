@@ -22,6 +22,83 @@ public static class ToolRegistrationPolicy
     public static bool CanAdvertiseSelectionWrite(AdapterDescriptor Descriptor, LocalToolPolicy Policy) =>
         Policy.Evaluate(ToolRiskClass.StudioLocalWrite) == PolicyDecision.Allow &&
         Descriptor.Capabilities.Contains(AdapterCapability.SelectionWrite);
+
+    public static bool CanAdvertiseProjectWrite(AdapterDescriptor Descriptor, LocalToolPolicy Policy) =>
+        Policy.Evaluate(ToolRiskClass.ProjectWrite) == PolicyDecision.Allow &&
+        Descriptor.Capabilities.Contains(AdapterCapability.ProjectWrite);
+}
+
+public sealed class ProjectWriteTools(IGargantuanAdapter Adapter, ToolExecutor Executor, LocalToolPolicy Policy)
+{
+    private readonly SemaphoreSlim Concurrency = new(McpLimits.MaximumConcurrentWrites, McpLimits.MaximumConcurrentWrites);
+
+    public Task<ToolResponse<ProjectWriteResult>> Create(
+        string ClassId,
+        string ParentId,
+        InitialPropertyWrite[]? InitialProperties = null,
+        long? ExpectedRevision = null,
+        CancellationToken CancellationToken = default) =>
+        ExecuteAsync(Token => Adapter.CreateInstanceAsync(new(
+            ClassId, new(ParentId), InitialProperties ?? [], ExpectedRevision), Token), CancellationToken);
+
+    public Task<ToolResponse<ProjectWriteResult>> Delete(
+        string ObjectId,
+        bool DeleteSubtree,
+        long? ExpectedRevision = null,
+        CancellationToken CancellationToken = default) =>
+        ExecuteAsync(Token => Adapter.DeleteInstanceAsync(new(new(ObjectId), DeleteSubtree, ExpectedRevision), Token), CancellationToken);
+
+    public Task<ToolResponse<ProjectWriteResult>> Duplicate(
+        string ObjectId,
+        long? ExpectedRevision = null,
+        CancellationToken CancellationToken = default) =>
+        ExecuteAsync(Token => Adapter.DuplicateInstanceAsync(new(new(ObjectId), ExpectedRevision), Token), CancellationToken);
+
+    public Task<ToolResponse<ProjectWriteResult>> Reparent(
+        string ObjectId,
+        string ParentId,
+        long? ExpectedRevision = null,
+        CancellationToken CancellationToken = default) =>
+        ExecuteAsync(Token => Adapter.ReparentInstanceAsync(new(new(ObjectId), new(ParentId), ExpectedRevision), Token), CancellationToken);
+
+    public Task<ToolResponse<ProjectWriteResult>> SetProperty(
+        string ObjectId,
+        ProjectPropertyTarget Property,
+        ProjectPropertyValue Value,
+        long? ExpectedRevision = null,
+        CancellationToken CancellationToken = default) =>
+        ExecuteAsync(Token => Adapter.SetPropertyAsync(new(new(ObjectId), Property, Value, ExpectedRevision), Token), CancellationToken);
+
+    public Task<ToolResponse<ProjectWriteResult>> Save(long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
+        ExecuteAsync(Token => Adapter.SaveProjectAsync(new(ExpectedRevision), Token), CancellationToken);
+
+    public Task<ToolResponse<ProjectWriteResult>> Undo(long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
+        ExecuteAsync(Token => Adapter.UndoAsync(new(ExpectedRevision), Token), CancellationToken);
+
+    public Task<ToolResponse<ProjectWriteResult>> Redo(long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
+        ExecuteAsync(Token => Adapter.RedoAsync(new(ExpectedRevision), Token), CancellationToken);
+
+    private async Task<ToolResponse<ProjectWriteResult>> ExecuteAsync(
+        Func<CancellationToken, Task<ProjectWriteResult>> Operation,
+        CancellationToken CancellationToken)
+    {
+        if (Policy.Evaluate(ToolRiskClass.ProjectWrite) != PolicyDecision.Allow)
+            return ToolResponse<ProjectWriteResult>.Fail(
+                GargantuanErrorCode.PermissionDenied,
+                "Durable project writes are not allowed by server policy.");
+        if (!await Concurrency.WaitAsync(0, CancellationToken).ConfigureAwait(false))
+            return ToolResponse<ProjectWriteResult>.Fail(
+                GargantuanErrorCode.ResourceLimit,
+                "Another MCP ProjectWrite operation is already in progress.");
+        try
+        {
+            return await Executor.ExecuteAsync(Operation, CancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            Concurrency.Release();
+        }
+    }
 }
 
 public sealed class ReadTools(IGargantuanAdapter Adapter, ToolExecutor Executor)
@@ -102,4 +179,52 @@ public sealed class McpStudioTools(StudioTools Tools)
     [Description("Changes only mock/Studio-local selection. This does not mutate the project DataModel.")]
     public async Task<CallToolResult> SetSelection(string[] ObjectIds, CancellationToken CancellationToken = default)
         => ToolExecutor.ToMcpResult(await Tools.SetSelection(ObjectIds, CancellationToken));
+}
+
+public sealed class McpProjectWriteTools(ProjectWriteTools Tools)
+{
+    [McpServerTool(Name = "instance.create", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false, UseStructuredContent = true, OutputSchemaType = typeof(ToolResponse<ProjectWriteResult>))]
+    [Description("Creates one schema-constructible instance under an opaque parent identity. InitialProperties are validated and committed atomically with creation; script Source is never accepted.")]
+    public async Task<CallToolResult> Create(string ClassId, string ParentId, InitialPropertyWrite[]? InitialProperties = null,
+        long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
+        ToolExecutor.ToMcpResult(await Tools.Create(ClassId, ParentId, InitialProperties, ExpectedRevision, CancellationToken));
+
+    [McpServerTool(Name = "instance.delete", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false, UseStructuredContent = true, OutputSchemaType = typeof(ToolResponse<ProjectWriteResult>))]
+    [Description("Deletes exactly the opaque target and its full descendant subtree through Studio history. DeleteSubtree must be true to acknowledge descendant deletion; root/protected/stale targets are rejected.")]
+    public async Task<CallToolResult> Delete(string ObjectId, bool DeleteSubtree,
+        long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
+        ToolExecutor.ToMcpResult(await Tools.Delete(ObjectId, DeleteSubtree, ExpectedRevision, CancellationToken));
+
+    [McpServerTool(Name = "instance.duplicate", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false, UseStructuredContent = true, OutputSchemaType = typeof(ToolResponse<ProjectWriteResult>))]
+    [Description("Duplicates the opaque source and all descendants using Studio's ordinary authoritative duplicate semantics. The duplicate is placed beside its source and receives fresh identities.")]
+    public async Task<CallToolResult> Duplicate(string ObjectId,
+        long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
+        ToolExecutor.ToMcpResult(await Tools.Duplicate(ObjectId, ExpectedRevision, CancellationToken));
+
+    [McpServerTool(Name = "instance.reparent", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false, UseStructuredContent = true, OutputSchemaType = typeof(ToolResponse<ProjectWriteResult>))]
+    [Description("Moves one opaque target beneath one opaque parent in the same current project. Studio rejects cycles, protected targets, stale identities, and incompatible parents.")]
+    public async Task<CallToolResult> Reparent(string ObjectId, string ParentId,
+        long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
+        ToolExecutor.ToMcpResult(await Tools.Reparent(ObjectId, ParentId, ExpectedRevision, CancellationToken));
+
+    [McpServerTool(Name = "instance.set_property", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false, UseStructuredContent = true, OutputSchemaType = typeof(ToolResponse<ProjectWriteResult>))]
+    [Description("Sets one schema-writable native, custom-class, or extension property on an opaque target using the canonical typed value representation. Names, paths, reflection, and script Source are not mutation targets.")]
+    public async Task<CallToolResult> SetProperty(string ObjectId, ProjectPropertyTarget Property, ProjectPropertyValue Value,
+        long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
+        ToolExecutor.ToMcpResult(await Tools.SetProperty(ObjectId, Property, Value, ExpectedRevision, CancellationToken));
+
+    [McpServerTool(Name = "project.save", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false, UseStructuredContent = true, OutputSchemaType = typeof(ToolResponse<ProjectWriteResult>))]
+    [Description("Atomically saves the current authoritative project to its existing Studio destination. No path or Save As destination is accepted.")]
+    public async Task<CallToolResult> Save(long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
+        ToolExecutor.ToMcpResult(await Tools.Save(ExpectedRevision, CancellationToken));
+
+    [McpServerTool(Name = "studio.undo", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false, UseStructuredContent = true, OutputSchemaType = typeof(ToolResponse<ProjectWriteResult>))]
+    [Description("Undoes the current document session's next authoritative history entry using the same Studio/EditorHost history used by manual commands.")]
+    public async Task<CallToolResult> Undo(long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
+        ToolExecutor.ToMcpResult(await Tools.Undo(ExpectedRevision, CancellationToken));
+
+    [McpServerTool(Name = "studio.redo", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false, UseStructuredContent = true, OutputSchemaType = typeof(ToolResponse<ProjectWriteResult>))]
+    [Description("Redoes the current document session's next authoritative history entry using the same Studio/EditorHost history used by manual commands.")]
+    public async Task<CallToolResult> Redo(long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
+        ToolExecutor.ToMcpResult(await Tools.Redo(ExpectedRevision, CancellationToken));
 }

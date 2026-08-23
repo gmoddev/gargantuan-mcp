@@ -1,3 +1,5 @@
+using System.Text.Json;
+
 namespace Gargantuan.Mcp.Contracts;
 
 public static class McpLimits
@@ -12,7 +14,12 @@ public static class McpLimits
     public const int MaximumQueryLength = 256;
     public const int MaximumSelectionSize = 128;
     public const int MaximumConcurrentRequests = 8;
+    public const int MaximumConcurrentWrites = 1;
     public const int MaximumContinuationTokenLength = 256;
+    public const int MaximumInitialPropertyCount = 32;
+    public const int MaximumPropertyStringBytes = 16 * 1024;
+    public const int MaximumProjectWriteRequestBytes = 48 * 1024;
+    public const int MaximumWriteDiagnostics = 8;
 }
 
 public readonly record struct ObjectIdentity(string Value)
@@ -27,6 +34,7 @@ public enum AdapterCapability
     SchemaInspection,
     SelectionInspection,
     SelectionWrite,
+    ProjectWrite,
 }
 
 public enum ToolRiskClass
@@ -54,7 +62,10 @@ public enum GargantuanErrorCode
     Conflict,
     StaleIdentity,
     CapabilityUnavailable,
+    CommandUnavailable,
+    ValidationFailed,
     ResourceLimit,
+    Cancelled,
     InternalError,
 }
 
@@ -79,6 +90,66 @@ public sealed record ListInstancesRequest(ObjectIdentity? ParentId, int Recursiv
 public sealed record GetChildrenRequest(ObjectIdentity ParentId, string? PageToken, int PageSize);
 public sealed record ListClassesRequest(string? PageToken, int PageSize);
 
+/// <summary>
+/// Closed MCP representation of a schema-typed property value. Type is one of Null,
+/// Bool, Int, Float, Double, String, Vector2, Vector3, Color3, UDim, UDim2,
+/// CFrame, EnumItem, SchemaEnum, or ObjectReference. Value carries the scalar,
+/// component array, or stable enum item value. Object is used only for an opaque
+/// ObjectReference; Enum and SchemaId/DefinitionVersion carry stable enum identity.
+/// </summary>
+public sealed record ProjectPropertyValue(
+    string Type,
+    JsonElement? Value = null,
+    string? Enum = null,
+    string? SchemaId = null,
+    uint? DefinitionVersion = null,
+    ObjectIdentity? Object = null);
+
+public enum ProjectPropertyKind
+{
+    Native,
+    Custom,
+    Extension,
+}
+
+public sealed record ProjectPropertyTarget(
+    ProjectPropertyKind Kind,
+    string Name,
+    string? DeclaringSchemaId = null);
+
+public sealed record InitialPropertyWrite(
+    ProjectPropertyTarget Property,
+    ProjectPropertyValue Value);
+
+public sealed record CreateInstanceRequest(
+    string ClassId,
+    ObjectIdentity ParentId,
+    IReadOnlyList<InitialPropertyWrite> InitialProperties,
+    long? ExpectedRevision);
+
+public sealed record DeleteInstanceRequest(
+    ObjectIdentity ObjectId,
+    bool DeleteSubtree,
+    long? ExpectedRevision);
+
+public sealed record DuplicateInstanceRequest(ObjectIdentity ObjectId, long? ExpectedRevision);
+public sealed record ReparentInstanceRequest(ObjectIdentity ObjectId, ObjectIdentity ParentId, long? ExpectedRevision);
+public sealed record SetPropertyRequest(
+    ObjectIdentity ObjectId,
+    ProjectPropertyTarget Property,
+    ProjectPropertyValue Value,
+    long? ExpectedRevision);
+public sealed record ProjectRevisionRequest(long? ExpectedRevision);
+
+public sealed record ProjectWriteDiagnostic(string Code, string Message);
+public sealed record ProjectWriteResult(
+    ObjectIdentity? ObjectId,
+    long Revision,
+    long PersistedRevision,
+    bool Dirty,
+    string? HistoryLabel,
+    IReadOnlyList<ProjectWriteDiagnostic> Diagnostics);
+
 public interface IGargantuanAdapter
 {
     AdapterDescriptor Descriptor { get; }
@@ -90,19 +161,27 @@ public interface IGargantuanAdapter
     Task<ClassDetails> GetClassAsync(string ClassId, CancellationToken CancellationToken);
     Task<IReadOnlyList<ObjectIdentity>> GetSelectionAsync(CancellationToken CancellationToken);
     Task<IReadOnlyList<ObjectIdentity>> SetSelectionAsync(IReadOnlyList<ObjectIdentity> Selection, CancellationToken CancellationToken);
+    Task<ProjectWriteResult> CreateInstanceAsync(CreateInstanceRequest Request, CancellationToken CancellationToken);
+    Task<ProjectWriteResult> DeleteInstanceAsync(DeleteInstanceRequest Request, CancellationToken CancellationToken);
+    Task<ProjectWriteResult> DuplicateInstanceAsync(DuplicateInstanceRequest Request, CancellationToken CancellationToken);
+    Task<ProjectWriteResult> ReparentInstanceAsync(ReparentInstanceRequest Request, CancellationToken CancellationToken);
+    Task<ProjectWriteResult> SetPropertyAsync(SetPropertyRequest Request, CancellationToken CancellationToken);
+    Task<ProjectWriteResult> SaveProjectAsync(ProjectRevisionRequest Request, CancellationToken CancellationToken);
+    Task<ProjectWriteResult> UndoAsync(ProjectRevisionRequest Request, CancellationToken CancellationToken);
+    Task<ProjectWriteResult> RedoAsync(ProjectRevisionRequest Request, CancellationToken CancellationToken);
 }
 
 public sealed class LocalToolPolicy
 {
     private readonly IReadOnlyDictionary<ToolRiskClass, PolicyDecision> Decisions;
 
-    public LocalToolPolicy(bool AllowStudioLocalWrite = false)
+    public LocalToolPolicy(bool AllowStudioLocalWrite = false, bool AllowProjectWrite = false)
     {
         Decisions = new Dictionary<ToolRiskClass, PolicyDecision>
         {
             [ToolRiskClass.Read] = PolicyDecision.Allow,
             [ToolRiskClass.StudioLocalWrite] = AllowStudioLocalWrite ? PolicyDecision.Allow : PolicyDecision.RequireApproval,
-            [ToolRiskClass.ProjectWrite] = PolicyDecision.RequireApproval,
+            [ToolRiskClass.ProjectWrite] = AllowProjectWrite ? PolicyDecision.Allow : PolicyDecision.RequireApproval,
             [ToolRiskClass.DestructiveWrite] = PolicyDecision.Deny,
             [ToolRiskClass.Execution] = PolicyDecision.Deny,
         };

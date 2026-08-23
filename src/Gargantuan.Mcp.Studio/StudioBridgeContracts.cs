@@ -1,3 +1,5 @@
+using System.Text.Json;
+
 namespace Gargantuan.Mcp.Studio;
 
 public enum StudioBridgeCapability
@@ -7,6 +9,7 @@ public enum StudioBridgeCapability
     SchemaInspection,
     SelectionInspection,
     SelectionWrite,
+    ProjectWrite,
 }
 
 public enum StudioBridgeErrorCode
@@ -18,7 +21,10 @@ public enum StudioBridgeErrorCode
     Conflict,
     StaleIdentity,
     CapabilityUnavailable,
+    CommandUnavailable,
+    ValidationFailed,
     ResourceLimit,
+    Cancelled,
     InternalError,
 }
 
@@ -101,6 +107,62 @@ public sealed record StudioListClassesRequest(
     int Limit,
     ulong? ExpectedSnapshotVersion);
 
+public enum StudioProjectPropertyKind
+{
+    Native,
+    Custom,
+    Extension,
+}
+
+public sealed record StudioProjectPropertyTarget(
+    StudioProjectPropertyKind Kind,
+    string Name,
+    string? DeclaringSchemaId);
+
+public sealed record StudioProjectPropertyValue(
+    string Type,
+    JsonElement? Value,
+    string? Enum,
+    string? SchemaId,
+    uint? DefinitionVersion,
+    StudioObjectIdentity? Object);
+
+public sealed record StudioInitialPropertyWrite(
+    StudioProjectPropertyTarget Property,
+    StudioProjectPropertyValue Value);
+
+public sealed record StudioCreateInstanceRequest(
+    string ClassId,
+    StudioObjectIdentity ParentId,
+    IReadOnlyList<StudioInitialPropertyWrite> InitialProperties,
+    long? ExpectedRevision);
+
+public sealed record StudioDeleteInstanceRequest(
+    StudioObjectIdentity ObjectId,
+    bool DeleteSubtree,
+    long? ExpectedRevision);
+
+public sealed record StudioDuplicateInstanceRequest(StudioObjectIdentity ObjectId, long? ExpectedRevision);
+public sealed record StudioReparentInstanceRequest(
+    StudioObjectIdentity ObjectId,
+    StudioObjectIdentity ParentId,
+    long? ExpectedRevision);
+public sealed record StudioSetPropertyRequest(
+    StudioObjectIdentity ObjectId,
+    StudioProjectPropertyTarget Property,
+    StudioProjectPropertyValue Value,
+    long? ExpectedRevision);
+public sealed record StudioProjectRevisionRequest(long? ExpectedRevision);
+
+public sealed record StudioProjectWriteDiagnostic(string Code, string Message);
+public sealed record StudioProjectWriteResult(
+    StudioObjectIdentity? ObjectId,
+    long Revision,
+    long PersistedRevision,
+    bool Dirty,
+    string? HistoryLabel,
+    IReadOnlyList<StudioProjectWriteDiagnostic> Diagnostics);
+
 /// <summary>
 /// A transport-free, Studio-owned view of one negotiated Studio session. Implementations
 /// must route through Studio document, schema, selection, command, and capability services;
@@ -117,4 +179,12 @@ public interface IStudioSessionClient
     Task<StudioClassDetails> GetClassAsync(string ClassId, CancellationToken CancellationToken);
     Task<IReadOnlyList<StudioObjectIdentity>> GetSelectionAsync(CancellationToken CancellationToken);
     Task<IReadOnlyList<StudioObjectIdentity>> SetSelectionAsync(IReadOnlyList<StudioObjectIdentity> Selection, CancellationToken CancellationToken);
+    Task<StudioProjectWriteResult> CreateInstanceAsync(StudioCreateInstanceRequest Request, CancellationToken CancellationToken);
+    Task<StudioProjectWriteResult> DeleteInstanceAsync(StudioDeleteInstanceRequest Request, CancellationToken CancellationToken);
+    Task<StudioProjectWriteResult> DuplicateInstanceAsync(StudioDuplicateInstanceRequest Request, CancellationToken CancellationToken);
+    Task<StudioProjectWriteResult> ReparentInstanceAsync(StudioReparentInstanceRequest Request, CancellationToken CancellationToken);
+    Task<StudioProjectWriteResult> SetPropertyAsync(StudioSetPropertyRequest Request, CancellationToken CancellationToken);
+    Task<StudioProjectWriteResult> SaveProjectAsync(StudioProjectRevisionRequest Request, CancellationToken CancellationToken);
+    Task<StudioProjectWriteResult> UndoAsync(StudioProjectRevisionRequest Request, CancellationToken CancellationToken);
+    Task<StudioProjectWriteResult> RedoAsync(StudioProjectRevisionRequest Request, CancellationToken CancellationToken);
 }

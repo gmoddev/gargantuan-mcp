@@ -79,7 +79,7 @@ public sealed class StudioSessionClientTests
     private static string CreateTestDirectory()
     {
         string DirectoryPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            Path.GetTempPath(),
             "GargantuanMcp", "ClientTests", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(DirectoryPath);
         return DirectoryPath;

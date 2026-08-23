@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Server;
 
 bool AllowStudioLocalWrite = args.Contains("--allow-studio-local-write", StringComparer.Ordinal);
+bool AllowProjectWrite = args.Contains("--allow-project-write", StringComparer.Ordinal);
 string? StudioBridgeDescriptorPath;
 try
 {
@@ -52,12 +53,13 @@ catch (GargantuanAdapterException Exception)
 HostApplicationBuilder Builder = Host.CreateApplicationBuilder(args);
 Builder.Logging.ClearProviders();
 Builder.Logging.AddConsole(Options => Options.LogToStandardErrorThreshold = LogLevel.Trace);
-LocalToolPolicy Policy = new(AllowStudioLocalWrite);
+LocalToolPolicy Policy = new(AllowStudioLocalWrite, AllowProjectWrite);
 Builder.Services.AddSingleton<IGargantuanAdapter>(Adapter);
 Builder.Services.AddSingleton(Policy);
 Builder.Services.AddSingleton<ToolExecutor>();
 Builder.Services.AddSingleton<ReadTools>();
 Builder.Services.AddSingleton<StudioTools>();
+Builder.Services.AddSingleton<ProjectWriteTools>();
 
 IMcpServerBuilder McpBuilder = Builder.Services.AddMcpServer(Options => Options.ProtocolVersion = "2026-07-28")
     .WithStdioServerTransport();
@@ -67,6 +69,9 @@ if (ToolRegistrationPolicy.CanAdvertiseReadTools(Adapter.Descriptor, Policy))
 
 if (ToolRegistrationPolicy.CanAdvertiseSelectionWrite(Adapter.Descriptor, Policy))
     McpBuilder.WithTools<McpStudioTools>();
+
+if (ToolRegistrationPolicy.CanAdvertiseProjectWrite(Adapter.Descriptor, Policy))
+    McpBuilder.WithTools<McpProjectWriteTools>();
 
 IHost ServerHost = Builder.Build();
 try
