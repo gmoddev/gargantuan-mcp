@@ -134,6 +134,15 @@ public sealed class MockGargantuanAdapter : IGargantuanAdapter
     public Task<ProjectWriteResult> RedoAsync(ProjectRevisionRequest Request, CancellationToken CancellationToken) =>
         UnsupportedProjectWrite<ProjectWriteResult>(CancellationToken);
 
+    public Task<ScriptSourceResult> GetScriptSourceAsync(ObjectIdentity ObjectId, CancellationToken CancellationToken) =>
+        UnsupportedProjectWrite<ScriptSourceResult>(CancellationToken);
+
+    public Task<ScriptWriteResult> CreateScriptAsync(CreateScriptRequest Request, CancellationToken CancellationToken) =>
+        UnsupportedProjectWrite<ScriptWriteResult>(CancellationToken);
+
+    public Task<ScriptWriteResult> SetScriptSourceAsync(SetScriptSourceRequest Request, CancellationToken CancellationToken) =>
+        UnsupportedProjectWrite<ScriptWriteResult>(CancellationToken);
+
     private static Task<T> UnsupportedProjectWrite<T>(CancellationToken CancellationToken)
     {
         CancellationToken.ThrowIfCancellationRequested();

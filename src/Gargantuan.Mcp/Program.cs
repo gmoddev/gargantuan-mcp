@@ -10,6 +10,13 @@ using ModelContextProtocol.Server;
 bool AllowStudioLocalWrite = args.Contains("--allow-studio-local-write", StringComparer.Ordinal);
 bool AllowProjectWrite = args.Contains("--allow-project-write", StringComparer.Ordinal);
 bool AllowDestructiveWrite = args.Contains("--allow-destructive-write", StringComparer.Ordinal);
+bool AllowScriptWrite = args.Contains("--allow-script-write", StringComparer.Ordinal);
+if (AllowScriptWrite && !AllowProjectWrite)
+{
+    Console.Error.WriteLine("[MCP:Startup] --allow-script-write requires --allow-project-write.");
+    Environment.ExitCode = 2;
+    return;
+}
 string? StudioBridgeDescriptorPath;
 try
 {
@@ -54,13 +61,18 @@ catch (GargantuanAdapterException Exception)
 HostApplicationBuilder Builder = Host.CreateApplicationBuilder(args);
 Builder.Logging.ClearProviders();
 Builder.Logging.AddConsole(Options => Options.LogToStandardErrorThreshold = LogLevel.Trace);
-LocalToolPolicy Policy = new(AllowStudioLocalWrite, AllowProjectWrite, AllowDestructiveWrite);
+LocalToolPolicy Policy = new(
+    AllowStudioLocalWrite,
+    AllowProjectWrite,
+    AllowDestructiveWrite,
+    AllowScriptWrite);
 Builder.Services.AddSingleton<IGargantuanAdapter>(Adapter);
 Builder.Services.AddSingleton(Policy);
 Builder.Services.AddSingleton<ToolExecutor>();
 Builder.Services.AddSingleton<ReadTools>();
 Builder.Services.AddSingleton<StudioTools>();
 Builder.Services.AddSingleton<ProjectWriteTools>();
+Builder.Services.AddSingleton<ScriptReadTools>();
 
 IMcpServerBuilder McpBuilder = Builder.Services.AddMcpServer(Options => Options.ProtocolVersion = "2026-07-28")
     .WithStdioServerTransport();
@@ -73,6 +85,12 @@ if (ToolRegistrationPolicy.CanAdvertiseSelectionWrite(Adapter.Descriptor, Policy
 
 if (ToolRegistrationPolicy.CanAdvertiseProjectWrite(Adapter.Descriptor, Policy))
     McpBuilder.WithTools<McpProjectWriteTools>();
+
+if (ToolRegistrationPolicy.CanAdvertiseScriptRead(Adapter.Descriptor, Policy))
+    McpBuilder.WithTools<McpScriptReadTools>();
+
+if (ToolRegistrationPolicy.CanAdvertiseScriptWrite(Adapter.Descriptor, Policy))
+    McpBuilder.WithTools<McpScriptWriteTools>();
 
 if (ToolRegistrationPolicy.CanAdvertiseDestructiveWrite(Adapter.Descriptor, Policy))
     McpBuilder.WithTools<McpDestructiveWriteTools>();

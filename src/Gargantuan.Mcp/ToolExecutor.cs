@@ -5,11 +5,20 @@ using ModelContextProtocol.Protocol;
 
 namespace Gargantuan.Mcp.Server;
 
-public sealed record ToolError(string Code, string Message);
+public sealed record ToolError(
+    string Code,
+    string Message,
+    ScriptConflictDetails? Details = null,
+    ScriptCommitState? CommitState = null);
 public sealed record ToolResponse<T>(bool Success, T? Result, ToolError? Error)
 {
     public static ToolResponse<T> Ok(T Result) => new(true, Result, null);
-    public static ToolResponse<T> Fail(GargantuanErrorCode Code, string Message) => new(false, default, new(Code.ToString(), Message));
+    public static ToolResponse<T> Fail(
+        GargantuanErrorCode Code,
+        string Message,
+        ScriptConflictDetails? Details = null,
+        ScriptCommitState? CommitState = null) =>
+        new(false, default, new(Code.ToString(), Message, Details, CommitState));
 }
 
 public sealed class ToolExecutor(ILogger<ToolExecutor> Logger)
@@ -29,7 +38,11 @@ public sealed class ToolExecutor(ILogger<ToolExecutor> Logger)
         }
         catch (GargantuanAdapterException Exception)
         {
-            return ToolResponse<T>.Fail(Exception.Code, Bound(Exception.SafeMessage));
+            return ToolResponse<T>.Fail(
+                Exception.Code,
+                Bound(Exception.SafeMessage),
+                Exception.ConflictDetails,
+                Exception.CommitState);
         }
         catch (OperationCanceledException) when (CancellationToken.IsCancellationRequested)
         {

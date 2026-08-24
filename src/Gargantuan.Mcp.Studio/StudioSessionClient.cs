@@ -12,8 +12,8 @@ namespace Gargantuan.Mcp.Studio;
 
 public sealed class StudioSessionClient : IStudioSessionClient, IAsyncDisposable
 {
-    public const int ProtocolVersion = 1;
-    public const int MaximumRequestBytes = 64 * 1024;
+    public const int ProtocolVersion = 2;
+    public const int MaximumRequestBytes = 512 * 1024;
     public const int MaximumResponseBytes = 1024 * 1024;
     public const int MaximumConcurrentOperations = 4;
     public static readonly TimeSpan ConnectionDeadline = TimeSpan.FromSeconds(5);
@@ -130,6 +130,14 @@ public sealed class StudioSessionClient : IStudioSessionClient, IAsyncDisposable
         return await InvokeAsync<StudioObjectIdentity[]>("SetSelection", new JsonObject { ["Selection"] = Encoded }, CancellationToken).ConfigureAwait(false);
     }
 
+    public Task<StudioScriptSourceResult> GetScriptSourceAsync(
+        StudioObjectIdentity ObjectId,
+        CancellationToken CancellationToken) =>
+        InvokeAsync<StudioScriptSourceResult>("GetScriptSource", new JsonObject
+        {
+            ["ObjectId"] = Identity(ObjectId),
+        }, CancellationToken);
+
     public Task<StudioProjectWriteResult> CreateInstanceAsync(StudioCreateInstanceRequest Request, CancellationToken CancellationToken) =>
         InvokeAsync<StudioProjectWriteResult>("CreateInstance", new JsonObject
         {
@@ -179,6 +187,29 @@ public sealed class StudioSessionClient : IStudioSessionClient, IAsyncDisposable
 
     public Task<StudioProjectWriteResult> RedoAsync(StudioProjectRevisionRequest Request, CancellationToken CancellationToken) =>
         InvokeAsync<StudioProjectWriteResult>("Redo", RevisionParameters(Request), CancellationToken);
+
+    public Task<StudioScriptWriteResult> CreateScriptAsync(
+        StudioCreateScriptRequest Request,
+        CancellationToken CancellationToken) =>
+        InvokeAsync<StudioScriptWriteResult>("CreateScript", new JsonObject
+        {
+            ["ClassId"] = Request.ClassId,
+            ["ParentId"] = Identity(Request.ParentId),
+            ["Name"] = Request.Name,
+            ["Source"] = Request.Source,
+            ["ExpectedRevision"] = Request.ExpectedRevision,
+        }, CancellationToken);
+
+    public Task<StudioScriptWriteResult> SetScriptSourceAsync(
+        StudioSetScriptSourceRequest Request,
+        CancellationToken CancellationToken) =>
+        InvokeAsync<StudioScriptWriteResult>("SetScriptSource", new JsonObject
+        {
+            ["ObjectId"] = Identity(Request.ObjectId),
+            ["Source"] = Request.Source,
+            ["ExpectedSourceRevision"] = Request.ExpectedSourceRevision,
+            ["ExpectedRevision"] = Request.ExpectedRevision,
+        }, CancellationToken);
 
     public async ValueTask DisposeAsync()
     {
@@ -313,7 +344,9 @@ public sealed class StudioSessionClient : IStudioSessionClient, IAsyncDisposable
             string Message = Code == StudioBridgeErrorCode.InternalError
                 ? "The Studio bridge request failed."
                 : BoundSafeMessage(Response.Error.Message);
-            throw new StudioBridgeException(Code, Message);
+            StudioScriptConflictDetails? Details = ValidateConflictDetails(Code, Response.Error.Details);
+            StudioScriptCommitState? CommitState = ValidateCommitState(Code, Response.Error.CommitState);
+            throw new StudioBridgeException(Code, Message, ConflictDetails: Details, CommitState: CommitState);
         }
         if (Response.Error is not null || Response.Result is null)
             throw ContractError("Studio returned an invalid success envelope.");
@@ -482,6 +515,34 @@ public sealed class StudioSessionClient : IStudioSessionClient, IAsyncDisposable
         return Message.Length <= MaximumSafeMessageLength ? Message : Message[..MaximumSafeMessageLength];
     }
 
+    private static StudioScriptConflictDetails? ValidateConflictDetails(
+        StudioBridgeErrorCode Code,
+        StudioScriptConflictDetails? Details)
+    {
+        if (Details is null) return null;
+        if (Code != StudioBridgeErrorCode.Conflict ||
+            Details.CurrentSourceRevision is <= 0 ||
+            Details.CurrentProjectRevision is <= 0 ||
+            string.IsNullOrWhiteSpace(Details.Recommendation) ||
+            Details.Recommendation.Length > MaximumSafeMessageLength)
+            throw ContractError("Studio returned invalid conflict details.");
+        return Details with { Recommendation = BoundSafeMessage(Details.Recommendation) };
+    }
+
+    private static StudioScriptCommitState? ValidateCommitState(
+        StudioBridgeErrorCode Code,
+        StudioScriptCommitState? CommitState)
+    {
+        if (CommitState is null) return null;
+        if (Code != StudioBridgeErrorCode.Unavailable ||
+            !CommitState.AuthoritativeCommitConfirmed ||
+            !CommitState.ProjectionUnavailable ||
+            string.IsNullOrWhiteSpace(CommitState.Recommendation) ||
+            CommitState.Recommendation.Length > MaximumSafeMessageLength)
+            throw ContractError("Studio returned invalid committed projection state.");
+        return CommitState with { Recommendation = BoundSafeMessage(CommitState.Recommendation) };
+    }
+
     private static bool CryptographicEquals(string Left, string Right) =>
         CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(Left), Encoding.UTF8.GetBytes(Right));
 
@@ -521,5 +582,7 @@ public sealed class StudioSessionClient : IStudioSessionClient, IAsyncDisposable
     {
         public required string Code { get; init; }
         public required string Message { get; init; }
+        public StudioScriptConflictDetails? Details { get; init; }
+        public StudioScriptCommitState? CommitState { get; init; }
     }
 }

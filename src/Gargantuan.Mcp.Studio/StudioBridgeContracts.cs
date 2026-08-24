@@ -10,6 +10,8 @@ public enum StudioBridgeCapability
     SelectionInspection,
     SelectionWrite,
     ProjectWrite,
+    ScriptInspection,
+    ScriptWrite,
 }
 
 public enum StudioBridgeErrorCode
@@ -28,11 +30,29 @@ public enum StudioBridgeErrorCode
     InternalError,
 }
 
-public sealed class StudioBridgeException(StudioBridgeErrorCode Code, string SafeMessage, Exception? InnerException = null)
+public sealed record StudioScriptConflictDetails(
+    int? CurrentSourceRevision,
+    long? CurrentProjectRevision,
+    bool LocalStudioEditsConflict,
+    string Recommendation);
+
+public sealed record StudioScriptCommitState(
+    bool AuthoritativeCommitConfirmed,
+    bool ProjectionUnavailable,
+    string Recommendation);
+
+public sealed class StudioBridgeException(
+    StudioBridgeErrorCode Code,
+    string SafeMessage,
+    Exception? InnerException = null,
+    StudioScriptConflictDetails? ConflictDetails = null,
+    StudioScriptCommitState? CommitState = null)
     : Exception(SafeMessage, InnerException)
 {
     public StudioBridgeErrorCode Code { get; } = Code;
     public string SafeMessage { get; } = SafeMessage;
+    public StudioScriptConflictDetails? ConflictDetails { get; } = ConflictDetails;
+    public StudioScriptCommitState? CommitState { get; } = CommitState;
 }
 
 public readonly record struct StudioObjectIdentity(uint Slot, uint Generation)
@@ -163,6 +183,36 @@ public sealed record StudioProjectWriteResult(
     string? HistoryLabel,
     IReadOnlyList<StudioProjectWriteDiagnostic> Diagnostics);
 
+public sealed record StudioScriptSourceResult(
+    StudioObjectIdentity ObjectId,
+    string ClassName,
+    string Source,
+    int SourceRevision,
+    long ProjectRevision);
+
+public sealed record StudioCreateScriptRequest(
+    string ClassId,
+    StudioObjectIdentity ParentId,
+    string Name,
+    string Source,
+    long? ExpectedRevision);
+
+public sealed record StudioSetScriptSourceRequest(
+    StudioObjectIdentity ObjectId,
+    string Source,
+    int ExpectedSourceRevision,
+    long? ExpectedRevision);
+
+public sealed record StudioScriptDiagnostic(string Code, string Message, int Line, int Column);
+public sealed record StudioScriptWriteResult(
+    StudioObjectIdentity ObjectId,
+    string ClassName,
+    int SourceRevision,
+    long ProjectRevision,
+    bool AuthoritativeCommitConfirmed,
+    bool LocalEditsConflict,
+    IReadOnlyList<StudioScriptDiagnostic> Diagnostics);
+
 /// <summary>
 /// A transport-free, Studio-owned view of one negotiated Studio session. Implementations
 /// must route through Studio document, schema, selection, command, and capability services;
@@ -187,4 +237,7 @@ public interface IStudioSessionClient
     Task<StudioProjectWriteResult> SaveProjectAsync(StudioProjectRevisionRequest Request, CancellationToken CancellationToken);
     Task<StudioProjectWriteResult> UndoAsync(StudioProjectRevisionRequest Request, CancellationToken CancellationToken);
     Task<StudioProjectWriteResult> RedoAsync(StudioProjectRevisionRequest Request, CancellationToken CancellationToken);
+    Task<StudioScriptSourceResult> GetScriptSourceAsync(StudioObjectIdentity ObjectId, CancellationToken CancellationToken);
+    Task<StudioScriptWriteResult> CreateScriptAsync(StudioCreateScriptRequest Request, CancellationToken CancellationToken);
+    Task<StudioScriptWriteResult> SetScriptSourceAsync(StudioSetScriptSourceRequest Request, CancellationToken CancellationToken);
 }

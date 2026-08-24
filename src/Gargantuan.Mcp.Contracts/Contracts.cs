@@ -20,6 +20,11 @@ public static class McpLimits
     public const int MaximumPropertyStringBytes = 16 * 1024;
     public const int MaximumProjectWriteRequestBytes = 48 * 1024;
     public const int MaximumWriteDiagnostics = 8;
+    public const int MaximumScriptSourceBytes = 64 * 1024;
+    public const int MaximumScriptNameBytes = 16 * 1024;
+    public const int MaximumScriptWriteRequestBytes = 512 * 1024;
+    public const int MaximumScriptDiagnostics = 8;
+    public const int MaximumScriptDiagnosticMessageCharacters = 256;
 }
 
 public readonly record struct ObjectIdentity(string Value)
@@ -35,6 +40,8 @@ public enum AdapterCapability
     SelectionInspection,
     SelectionWrite,
     ProjectWrite,
+    ScriptInspection,
+    ScriptWrite,
 }
 
 public enum ToolRiskClass
@@ -42,6 +49,7 @@ public enum ToolRiskClass
     Read,
     StudioLocalWrite,
     ProjectWrite,
+    ScriptWrite,
     DestructiveWrite,
     Execution,
 }
@@ -69,11 +77,29 @@ public enum GargantuanErrorCode
     InternalError,
 }
 
-public sealed class GargantuanAdapterException(GargantuanErrorCode Code, string SafeMessage, Exception? InnerException = null)
+public sealed record ScriptConflictDetails(
+    int? CurrentSourceRevision,
+    long? CurrentProjectRevision,
+    bool LocalStudioEditsConflict,
+    string Recommendation);
+
+public sealed record ScriptCommitState(
+    bool AuthoritativeCommitConfirmed,
+    bool ProjectionUnavailable,
+    string Recommendation);
+
+public sealed class GargantuanAdapterException(
+    GargantuanErrorCode Code,
+    string SafeMessage,
+    Exception? InnerException = null,
+    ScriptConflictDetails? ConflictDetails = null,
+    ScriptCommitState? CommitState = null)
     : Exception(SafeMessage, InnerException)
 {
     public GargantuanErrorCode Code { get; } = Code;
     public string SafeMessage { get; } = SafeMessage;
+    public ScriptConflictDetails? ConflictDetails { get; } = ConflictDetails;
+    public ScriptCommitState? CommitState { get; } = CommitState;
 }
 
 public sealed record AdapterDescriptor(string Name, string Version, IReadOnlySet<AdapterCapability> Capabilities, bool IsMock);
@@ -150,6 +176,36 @@ public sealed record ProjectWriteResult(
     string? HistoryLabel,
     IReadOnlyList<ProjectWriteDiagnostic> Diagnostics);
 
+public sealed record ScriptSourceResult(
+    ObjectIdentity ObjectId,
+    string ClassName,
+    string Source,
+    int SourceRevision,
+    long ProjectRevision);
+
+public sealed record CreateScriptRequest(
+    string ClassId,
+    ObjectIdentity ParentId,
+    string Name,
+    string Source,
+    long? ExpectedRevision);
+
+public sealed record SetScriptSourceRequest(
+    ObjectIdentity ObjectId,
+    string Source,
+    int ExpectedSourceRevision,
+    long? ExpectedRevision);
+
+public sealed record ScriptDiagnostic(string Code, string Message, int Line, int Column);
+public sealed record ScriptWriteResult(
+    ObjectIdentity ObjectId,
+    string ClassName,
+    int SourceRevision,
+    long ProjectRevision,
+    bool AuthoritativeCommitConfirmed,
+    bool LocalEditsConflict,
+    IReadOnlyList<ScriptDiagnostic> Diagnostics);
+
 public interface IGargantuanAdapter
 {
     AdapterDescriptor Descriptor { get; }
@@ -169,6 +225,9 @@ public interface IGargantuanAdapter
     Task<ProjectWriteResult> SaveProjectAsync(ProjectRevisionRequest Request, CancellationToken CancellationToken);
     Task<ProjectWriteResult> UndoAsync(ProjectRevisionRequest Request, CancellationToken CancellationToken);
     Task<ProjectWriteResult> RedoAsync(ProjectRevisionRequest Request, CancellationToken CancellationToken);
+    Task<ScriptSourceResult> GetScriptSourceAsync(ObjectIdentity ObjectId, CancellationToken CancellationToken);
+    Task<ScriptWriteResult> CreateScriptAsync(CreateScriptRequest Request, CancellationToken CancellationToken);
+    Task<ScriptWriteResult> SetScriptSourceAsync(SetScriptSourceRequest Request, CancellationToken CancellationToken);
 }
 
 public sealed class LocalToolPolicy
@@ -176,13 +235,14 @@ public sealed class LocalToolPolicy
     private readonly IReadOnlyDictionary<ToolRiskClass, PolicyDecision> Decisions;
 
     public LocalToolPolicy(bool AllowStudioLocalWrite = false, bool AllowProjectWrite = false,
-        bool AllowDestructiveWrite = false)
+        bool AllowDestructiveWrite = false, bool AllowScriptWrite = false)
     {
         Decisions = new Dictionary<ToolRiskClass, PolicyDecision>
         {
             [ToolRiskClass.Read] = PolicyDecision.Allow,
             [ToolRiskClass.StudioLocalWrite] = AllowStudioLocalWrite ? PolicyDecision.Allow : PolicyDecision.RequireApproval,
             [ToolRiskClass.ProjectWrite] = AllowProjectWrite ? PolicyDecision.Allow : PolicyDecision.RequireApproval,
+            [ToolRiskClass.ScriptWrite] = AllowScriptWrite ? PolicyDecision.Allow : PolicyDecision.Deny,
             [ToolRiskClass.DestructiveWrite] = AllowDestructiveWrite ? PolicyDecision.Allow : PolicyDecision.Deny,
             [ToolRiskClass.Execution] = PolicyDecision.Deny,
         };

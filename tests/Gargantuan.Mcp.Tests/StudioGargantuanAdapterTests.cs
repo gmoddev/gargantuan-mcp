@@ -337,6 +337,119 @@ public sealed class StudioGargantuanAdapterTests
     }
 
     [Fact]
+    public async Task ScriptSourceAndWritesPreserveExactTextIdentityAndRevisions()
+    {
+        FakeStudioSessionClient Client = new(FakeStudioSessionClient.AllCapabilities);
+        StudioGargantuanAdapter Adapter = await StudioGargantuanAdapter.CreateAsync(Client);
+        ProjectInfo Project = await Adapter.GetProjectInfoAsync(default);
+
+        ScriptSourceResult Source = await Adapter.GetScriptSourceAsync(Project.RootId, default);
+        Assert.Equal(Project.RootId, Source.ObjectId);
+        Assert.Equal("return 1\n", Source.Source);
+        Assert.Equal(4, Source.SourceRevision);
+        Assert.Equal(17, Source.ProjectRevision);
+
+        ScriptWriteResult Created = await Adapter.CreateScriptAsync(new(
+            "ModuleScript", Project.RootId, "MCP Module", "return { value = 1 }\n", 17), default);
+        Assert.True(Created.AuthoritativeCommitConfirmed);
+        Assert.Equal(18, Created.ProjectRevision);
+        Assert.Equal("return { value = 1 }\n", Client.LastCreateScriptRequest?.Source);
+        Assert.Equal(new StudioObjectIdentity(1, 7), Client.LastCreateScriptRequest?.ParentId);
+
+        ScriptWriteResult Set = await Adapter.SetScriptSourceAsync(new(
+            Project.RootId, "local =\n", 4, 17), default);
+        Assert.Equal(5, Set.SourceRevision);
+        Assert.Single(Set.Diagnostics);
+        Assert.Equal("LuauSyntax", Set.Diagnostics[0].Code);
+        Assert.Equal("local =\n", Client.LastSetScriptRequest?.Source);
+        Assert.Equal(4, Client.LastSetScriptRequest?.ExpectedSourceRevision);
+    }
+
+    [Fact]
+    public async Task ScriptWriteRequiresBothAuthoritiesSharesConcurrencyAndPreservesConflictDetails()
+    {
+        FakeStudioSessionClient Client = new(FakeStudioSessionClient.AllCapabilities);
+        StudioGargantuanAdapter Adapter = await StudioGargantuanAdapter.CreateAsync(Client);
+        ProjectInfo Project = await Adapter.GetProjectInfoAsync(default);
+        ToolExecutor Executor = new(NullLogger<ToolExecutor>.Instance);
+
+        ProjectWriteTools NoScriptAuthority = new(Adapter, Executor,
+            new LocalToolPolicy(AllowProjectWrite: true));
+        ToolResponse<ScriptWriteResult> Denied = await NoScriptAuthority.SetScriptSource(
+            Project.RootId.Value, "return 2\n", 4);
+        Assert.Equal(nameof(GargantuanErrorCode.PermissionDenied), Denied.Error?.Code);
+        Assert.Equal(0, Client.ScriptWriteCalls);
+
+        TaskCompletionSource Entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource Release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Client.SetScriptOperation = async CancellationToken =>
+        {
+            Entered.SetResult();
+            await Release.Task.WaitAsync(CancellationToken);
+            return FakeStudioSessionClient.SuccessfulSetScript;
+        };
+        ProjectWriteTools Allowed = new(Adapter, Executor, new LocalToolPolicy(
+            AllowProjectWrite: true, AllowScriptWrite: true));
+        Task<ToolResponse<ScriptWriteResult>> First = Allowed.SetScriptSource(
+            Project.RootId.Value, "return 2\n", 4);
+        await Entered.Task;
+        ToolResponse<ProjectWriteResult> Concurrent = await Allowed.Save();
+        Assert.Equal(nameof(GargantuanErrorCode.ResourceLimit), Concurrent.Error?.Code);
+        Release.SetResult();
+        Assert.True((await First).Success);
+
+        Client.SetScriptOperation = null;
+        Client.ScriptWriteFailure = new StudioBridgeException(
+            StudioBridgeErrorCode.Conflict,
+            "The authoritative script source changed before commit.",
+            ConflictDetails: new StudioScriptConflictDetails(
+                7, 21, true, "Reread script.get_source before retrying."));
+        ToolResponse<ScriptWriteResult> Conflict = await Allowed.SetScriptSource(
+            Project.RootId.Value, "return 3\n", 5);
+        Assert.Equal(nameof(GargantuanErrorCode.Conflict), Conflict.Error?.Code);
+        Assert.Equal(7, Conflict.Error?.Details?.CurrentSourceRevision);
+        Assert.Equal(21, Conflict.Error?.Details?.CurrentProjectRevision);
+        Assert.True(Conflict.Error?.Details?.LocalStudioEditsConflict);
+
+        Client.ScriptWriteFailure = new StudioBridgeException(
+            StudioBridgeErrorCode.Unavailable,
+            "EditorHost committed the command, but Studio projection recovery failed.",
+            CommitState: new StudioScriptCommitState(
+                true, true, "Reopen Studio and reread authoritative state."));
+        ToolResponse<ScriptWriteResult> CommittedUnavailable = await Allowed.SetScriptSource(
+            Project.RootId.Value, "return 4\n", 7);
+        Assert.Equal(nameof(GargantuanErrorCode.Unavailable), CommittedUnavailable.Error?.Code);
+        Assert.True(CommittedUnavailable.Error?.CommitState?.AuthoritativeCommitConfirmed);
+        Assert.True(CommittedUnavailable.Error?.CommitState?.ProjectionUnavailable);
+    }
+
+    [Fact]
+    public async Task ScriptWriteBoundsRejectBeforeBridgeInvocation()
+    {
+        FakeStudioSessionClient Client = new(FakeStudioSessionClient.AllCapabilities);
+        StudioGargantuanAdapter Adapter = await StudioGargantuanAdapter.CreateAsync(Client);
+        ProjectInfo Project = await Adapter.GetProjectInfoAsync(default);
+
+        GargantuanAdapterException Oversized = await Assert.ThrowsAsync<GargantuanAdapterException>(() =>
+            Adapter.CreateScriptAsync(new("ModuleScript", Project.RootId, "Module",
+                new string('x', McpLimits.MaximumScriptSourceBytes + 1), null), default));
+        Assert.Equal(GargantuanErrorCode.ResourceLimit, Oversized.Code);
+
+        GargantuanAdapterException InvalidRevision = await Assert.ThrowsAsync<GargantuanAdapterException>(() =>
+            Adapter.SetScriptSourceAsync(new(Project.RootId, "return 1\n", 0, null), default));
+        Assert.Equal(GargantuanErrorCode.InvalidArgument, InvalidRevision.Code);
+
+        GargantuanAdapterException EmbeddedNul = await Assert.ThrowsAsync<GargantuanAdapterException>(() =>
+            Adapter.CreateScriptAsync(new("ModuleScript", Project.RootId, "Module", "return\0 1", null), default));
+        Assert.Equal(GargantuanErrorCode.InvalidArgument, EmbeddedNul.Code);
+        Assert.Equal(0, Client.ScriptWriteCalls);
+
+        ScriptWriteResult ExactUtf8Limit = await Adapter.CreateScriptAsync(new(
+            "ModuleScript", Project.RootId, "Module", new string('\u00e9', 32 * 1024), null), default);
+        Assert.True(ExactUtf8Limit.AuthoritativeCommitConfirmed);
+    }
+
+    [Fact]
     public void ToolAdvertisementRequiresBothServerPolicyAndAdapterCapability()
     {
         AdapterDescriptor ReadOnly = new("Studio", "1", new HashSet<AdapterCapability>
@@ -354,6 +467,18 @@ public sealed class StudioGargantuanAdapterTests
         {
             Capabilities = new HashSet<AdapterCapability>(ReadOnly.Capabilities) { AdapterCapability.ProjectWrite },
         };
+        AdapterDescriptor ScriptReadable = ReadOnly with
+        {
+            Capabilities = new HashSet<AdapterCapability>(ReadOnly.Capabilities) { AdapterCapability.ScriptInspection },
+        };
+        AdapterDescriptor ScriptWritable = ReadOnly with
+        {
+            Capabilities = new HashSet<AdapterCapability>(ReadOnly.Capabilities)
+            {
+                AdapterCapability.ProjectWrite,
+                AdapterCapability.ScriptWrite,
+            },
+        };
 
         Assert.True(ToolRegistrationPolicy.CanAdvertiseReadTools(ReadOnly, new LocalToolPolicy()));
         Assert.False(ToolRegistrationPolicy.CanAdvertiseSelectionWrite(ReadOnly, new LocalToolPolicy(true)));
@@ -362,6 +487,17 @@ public sealed class StudioGargantuanAdapterTests
         Assert.False(ToolRegistrationPolicy.CanAdvertiseProjectWrite(ReadOnly, new LocalToolPolicy(AllowProjectWrite: true)));
         Assert.False(ToolRegistrationPolicy.CanAdvertiseProjectWrite(ProjectWritable, new LocalToolPolicy()));
         Assert.True(ToolRegistrationPolicy.CanAdvertiseProjectWrite(ProjectWritable, new LocalToolPolicy(AllowProjectWrite: true)));
+        Assert.True(ToolRegistrationPolicy.CanAdvertiseScriptRead(ScriptReadable, new LocalToolPolicy()));
+        Assert.False(ToolRegistrationPolicy.CanAdvertiseScriptRead(ReadOnly, new LocalToolPolicy()));
+        Assert.False(ToolRegistrationPolicy.CanAdvertiseScriptWrite(ReadOnly, new LocalToolPolicy()));
+        Assert.False(ToolRegistrationPolicy.CanAdvertiseScriptWrite(ReadOnly,
+            new LocalToolPolicy(AllowProjectWrite: true, AllowScriptWrite: true)));
+        Assert.False(ToolRegistrationPolicy.CanAdvertiseScriptWrite(ScriptWritable,
+            new LocalToolPolicy(AllowProjectWrite: true)));
+        Assert.False(ToolRegistrationPolicy.CanAdvertiseScriptWrite(ScriptWritable,
+            new LocalToolPolicy(AllowScriptWrite: true)));
+        Assert.True(ToolRegistrationPolicy.CanAdvertiseScriptWrite(ScriptWritable,
+            new LocalToolPolicy(AllowProjectWrite: true, AllowScriptWrite: true)));
         Assert.False(ToolRegistrationPolicy.CanAdvertiseDestructiveWrite(ProjectWritable,
             new LocalToolPolicy(AllowProjectWrite: false, AllowDestructiveWrite: false)));
         Assert.False(ToolRegistrationPolicy.CanAdvertiseDestructiveWrite(ProjectWritable,
@@ -389,6 +525,9 @@ public sealed class StudioGargantuanAdapterTests
             new HashSet<StudioBridgeCapability>(Enum.GetValues<StudioBridgeCapability>());
         public static StudioProjectWriteResult SuccessfulWrite { get; } =
             new(new StudioObjectIdentity(10, 2), 18, 16, true, "MCP write", []);
+        public static StudioScriptWriteResult SuccessfulSetScript { get; } =
+            new(RootId, "ModuleScript", 5, 18, true, false,
+                [new("LuauSyntax", "Expected expression.", 1, 7)]);
 
         public FakeStudioSessionClient(IReadOnlySet<StudioBridgeCapability> Capabilities, string SessionId = "fake-session-1")
         {
@@ -409,6 +548,12 @@ public sealed class StudioGargantuanAdapterTests
         public StudioCreateInstanceRequest? LastCreateRequest { get; private set; }
         public Exception? ProjectWriteFailure { get; set; }
         public Func<CancellationToken, Task<StudioProjectWriteResult>>? SaveOperation { get; set; }
+        public int ScriptReadCalls { get; private set; }
+        public int ScriptWriteCalls { get; private set; }
+        public StudioCreateScriptRequest? LastCreateScriptRequest { get; private set; }
+        public StudioSetScriptSourceRequest? LastSetScriptRequest { get; private set; }
+        public Exception? ScriptWriteFailure { get; set; }
+        public Func<CancellationToken, Task<StudioScriptWriteResult>>? SetScriptOperation { get; set; }
 
         public Task<StudioSessionDescriptor> DescribeSessionAsync(CancellationToken CancellationToken)
         {
@@ -524,6 +669,43 @@ public sealed class StudioGargantuanAdapterTests
 
         public Task<StudioProjectWriteResult> RedoAsync(StudioProjectRevisionRequest Request, CancellationToken CancellationToken) =>
             CompleteWriteAsync(CancellationToken);
+
+        public Task<StudioScriptSourceResult> GetScriptSourceAsync(
+            StudioObjectIdentity ObjectId,
+            CancellationToken CancellationToken)
+        {
+            CancellationToken.ThrowIfCancellationRequested();
+            ScriptReadCalls++;
+            return Task.FromResult(new StudioScriptSourceResult(
+                ObjectId, "ModuleScript", "return 1\n", 4, 17));
+        }
+
+        public Task<StudioScriptWriteResult> CreateScriptAsync(
+            StudioCreateScriptRequest Request,
+            CancellationToken CancellationToken)
+        {
+            CancellationToken.ThrowIfCancellationRequested();
+            ProjectWriteCalls++;
+            ScriptWriteCalls++;
+            LastCreateScriptRequest = Request;
+            if (ScriptWriteFailure is not null)
+                return Task.FromException<StudioScriptWriteResult>(ScriptWriteFailure);
+            return Task.FromResult(new StudioScriptWriteResult(
+                new StudioObjectIdentity(10, 2), "ModuleScript", 2, 18, true, false, []));
+        }
+
+        public Task<StudioScriptWriteResult> SetScriptSourceAsync(
+            StudioSetScriptSourceRequest Request,
+            CancellationToken CancellationToken)
+        {
+            CancellationToken.ThrowIfCancellationRequested();
+            ProjectWriteCalls++;
+            ScriptWriteCalls++;
+            LastSetScriptRequest = Request;
+            if (ScriptWriteFailure is not null)
+                return Task.FromException<StudioScriptWriteResult>(ScriptWriteFailure);
+            return SetScriptOperation?.Invoke(CancellationToken) ?? Task.FromResult(SuccessfulSetScript);
+        }
 
         private Task<StudioProjectWriteResult> CompleteWriteAsync(CancellationToken CancellationToken)
         {

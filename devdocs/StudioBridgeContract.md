@@ -2,7 +2,7 @@
 
 ## Purpose and ownership
 
-ProjectWrite Foundation extends `IStudioSessionClient` and Studio's committed protocol version 1 with bounded semantic project commands. Studio implements the bridge using Studio-owned session, document, schema, selection, command, and capability services.
+ScriptWrite Foundation extends `IStudioSessionClient` and Studio's committed protocol version 2 with bounded semantic project and script commands. Studio implements the bridge using Studio-owned session, document, schema, selection, script-workspace, command, and capability services.
 
 ```text
 StudioGargantuanAdapter
@@ -29,6 +29,7 @@ One bridge instance represents one already-negotiated Studio session and impleme
 | `GetClassAsync` | Resolve one active class by stable schema ID and return bounded inheritance, provenance, constructibility, and reflected property metadata. |
 | `GetSelectionAsync` | Read bounded, live identities from Studio's local `SelectionService`. Prune/deny dead identities according to the existing Studio selection lifecycle. |
 | `SetSelectionAsync` | Require the live Studio selection-write/`SelectionAccess` capability, validate every identity against the current document, atomically call Studio's local selection service, and return the accepted selection. This must not write the project journal. |
+| `GetScriptSourceAsync` | Require ScriptInspection, validate a current generation-safe script identity, and return exact bounded source, schema-derived class, Engine source revision, and project revision. |
 | `CreateInstanceAsync` | Require ProjectWrite, validate constructible class/parent and at most 32 initial native/custom properties, then execute one atomic create transaction and return the new identity/revision. |
 | `DeleteInstanceAsync` | Require explicit subtree acknowledgement, reject root/stale targets, execute ordinary authoritative destruction, and return no now-stale target identity. |
 | `DuplicateInstanceAsync` | Invoke ordinary EditorHost subtree duplicate semantics and return the fresh duplicate-root identity. |
@@ -36,8 +37,10 @@ One bridge instance represents one already-negotiated Studio session and impleme
 | `SetPropertyAsync` | Validate one native/custom/extension target and deterministic typed value through active schema metadata, then execute one authoritative property transaction. |
 | `SaveProjectAsync` | Save only to the current project location through the existing command; accept no path or Save As input. |
 | `UndoAsync` / `RedoAsync` | Use the current session's shared Studio command stack and return the reconciled authoritative revision/state. |
+| `CreateScriptAsync` | Require ProjectWrite plus ScriptWrite; validate schema-derived script class, parent, name/source bounds, and optional project revision; atomically attach name, initial source, and parent in one authoritative transaction. |
+| `SetScriptSourceAsync` | Require ProjectWrite plus ScriptWrite; reject dirty local buffers; replace exact source using mandatory Engine source revision and optional project revision; reconcile open tabs and return bounded diagnostics. |
 
-There is no generic execute/reflection/journal method and no script-source mutation, Play, viewport, arbitrary filesystem, Save As, shell, process, network, secret, trust-state, or native-memory operation.
+There is no generic execute/reflection/journal method and no script execution, Play, viewport, arbitrary filesystem, Save As, shell, process, network, secret, trust-state, or native-memory operation. Script deletion remains ordinary `instance.delete` with DestructiveWrite.
 
 ## Identity and session lifecycle
 
@@ -76,24 +79,24 @@ The implementation returns only the closed `StudioBridgeErrorCode` set:
 - `Cancelled` for a request cancelled before authoritative commit; and
 - `InternalError` for all other failures.
 
-Only explicitly safe, bounded messages may accompany non-internal errors. Internal exception text, paths, tokens, IPC details, stack traces, and Studio private state must remain on the Studio side. Request cancellation propagates through the command runner. Once an EditorHost transaction commits, the response reports that result even if the client cancels afterward; disconnect before a result is available is `Unavailable` and never asserts rollback.
+Only explicitly safe, bounded messages may accompany non-internal errors. Internal exception text, paths, tokens, IPC details, stack traces, and Studio private state must remain on the Studio side. Script conflicts may include bounded current source/project revisions, local-edit conflict state, and a reread recommendation, but never source. Once EditorHost commits, post-commit failure is `Unavailable` with validated authoritative-confirmed/projection-unavailable state and never asserts rollback.
 
 ## Implemented transport and startup
 
 Studio is explicitly launched with `--mcp-bridge-descriptor <absolute LocalApplicationData path>`. MCP is separately launched with `--studio-bridge-descriptor <the same path>`. Normal launches expose no Studio bridge, and normal MCP launches remain mock-backed.
 
-The descriptor is protocol version 1 with exact `Transport`, `PipeName`, `SessionId`, `Token`, and `ProcessId` fields. Transport is `windows-named-pipe`; token is 256 random bits. Its absolute path must remain below `LocalApplicationData`, and the root, every existing parent component, and the leaf must not be a symbolic link or Windows reparse point. The descriptor is read once and is never a discovery directory or reattachment mechanism.
+The descriptor is protocol version 2 with exact `Transport`, `PipeName`, `SessionId`, `Token`, and `ProcessId` fields. Transport is `windows-named-pipe`; token is 256 random bits. Its absolute path must remain below `LocalApplicationData`, and the root, every existing parent component, and the leaf must not be a symbolic link or Windows reparse point. The descriptor is read once and is never a discovery directory or reattachment mechanism.
 
-Each request uses one `CurrentUserOnly` Windows byte-mode named-pipe connection and one four-byte little-endian length-prefixed UTF-8 JSON request/response. The authenticated envelope contains exact `Version`, `RequestId`, `SessionId`, `Token`, `Method`, and `Parameters` fields. The implemented bounds are 64 KiB request, 1 MiB response, JSON depth 32, four client operations, one concurrent ProjectWrite, 20 ProjectWrite starts per rolling second per Studio session, 48 KiB serialized ProjectWrite DTO, 32 create-initialization properties, 16 KiB UTF-8 property strings, five-second connection establishment, and 30-second request completion. Write results return at most eight safe diagnostics.
+Each request uses one `CurrentUserOnly` Windows byte-mode named-pipe connection and one four-byte little-endian length-prefixed UTF-8 JSON request/response. The authenticated envelope contains exact `Version`, `RequestId`, `SessionId`, `Token`, `Method`, and `Parameters` fields. Bounds are 512 KiB request, 1 MiB response, JSON depth 32, four client operations, one shared concurrent ProjectWrite/ScriptWrite, 20 write starts per rolling second, 48 KiB ordinary ProjectWrite DTO, 512 KiB ScriptWrite DTO, 64 KiB UTF-8 source, 16 KiB UTF-8 script name/property string, 32 create properties, eight script diagnostics with 256-character messages, 250 ms syntax analysis, five-second connection establishment, and 30-second request completion.
 
-The client validates version, transport, all descriptor fields, token size, frame sizes, response version/request ID, exact response shape, semantic DTOs, and closed errors. It never logs the token. Both Studio and MCP must explicitly opt into ProjectWrite (`--allow-mcp-project-write` and `--allow-project-write` respectively); live bridge existence alone is insufficient. Cancellation closes the connection; disconnect, timeout, Studio exit, and replacement fail as bounded `Unavailable`.
+The client validates version, transport, all descriptor fields, token size, frame sizes, response version/request ID, exact response shape, semantic DTOs, and closed errors. It never logs the token. Both sides must opt into ProjectWrite; both must separately opt into ScriptWrite (`--allow-mcp-script-write` and `--allow-script-write`). Cancellation closes the connection; disconnect, timeout, Studio exit, and replacement fail as bounded `Unavailable`.
 
 ## Deferred bridge conformance artifact
 
 The real `Gargantuan.Mcp.LiveStudioSmoke` proves matching builds end to end, but
 Studio and MCP still duplicate bridge method, error, and limit constants. A
 separate contract-release milestone should have Studio publish
-`contracts/studio-mcp-bridge-v1.json` containing the descriptor/envelope version,
+`contracts/studio-mcp-bridge-v2.json` containing the descriptor/envelope version,
 method names, closed error codes, request/response schema hashes, capability
 mapping, and every frame/operation/resource limit, together with canonical JSON
 vectors. MCP should pin the artifact to its supported Studio release and compare

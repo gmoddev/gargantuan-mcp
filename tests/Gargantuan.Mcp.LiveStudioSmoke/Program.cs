@@ -10,8 +10,13 @@ string DescriptorPath = GetRequiredOption(args, "--descriptor");
 bool WaitForInvalidation = args.Contains("--wait-for-invalidation", StringComparer.Ordinal);
 bool WrongTokenCheck = args.Contains("--wrong-token-check", StringComparer.Ordinal);
 bool ProjectWrite = args.Contains("--project-write", StringComparer.Ordinal);
+bool ScriptWrite = args.Contains("--script-write", StringComparer.Ordinal);
 bool VerifyPersistence = args.Contains("--verify-project-write-persistence", StringComparer.Ordinal);
+bool ExpectPostCommitFault = args.Contains("--expect-scriptwrite-postcommit-fault", StringComparer.Ordinal);
 string? ProjectPath = GetOptionalOption(args, "--project");
+Require(!ScriptWrite || ProjectWrite, "--script-write requires --project-write.");
+Require(!ExpectPostCommitFault || ScriptWrite,
+    "--expect-scriptwrite-postcommit-fault requires --script-write.");
 
 if (WrongTokenCheck)
 {
@@ -30,6 +35,7 @@ if (ProjectWrite)
     ServerArguments.Add("--allow-project-write");
     ServerArguments.Add("--allow-destructive-write");
 }
+if (ScriptWrite) ServerArguments.Add("--allow-script-write");
 StdioClientTransport Transport = new(new StdioClientTransportOptions
 {
     Name = "Gargantuan MCP live Studio smoke",
@@ -45,7 +51,7 @@ string[] Names = Tools.Select(Tool => Tool.Name).Order(StringComparer.Ordinal).T
 string[] ExpectedTools =
 [
     "instance.get", "instance.get_children", "project.get_info", "project.list_instances",
-    "schema.get_class", "schema.list_classes", "studio.get_selection", "studio.set_selection",
+    "schema.get_class", "schema.list_classes", "script.get_source", "studio.get_selection", "studio.set_selection",
 ];
 if (ProjectWrite)
 {
@@ -55,6 +61,11 @@ if (ProjectWrite)
         "instance.create", "instance.delete", "instance.duplicate", "instance.reparent",
         "instance.set_property", "project.save", "studio.undo", "studio.redo",
     ];
+    Array.Sort(ExpectedTools, StringComparer.Ordinal);
+}
+if (ScriptWrite)
+{
+    ExpectedTools = [.. ExpectedTools, "script.create", "script.set_source"];
     Array.Sort(ExpectedTools, StringComparer.Ordinal);
 }
 Require(Names.SequenceEqual(ExpectedTools),
@@ -71,6 +82,37 @@ JsonElement Instances = Result(await Client.CallToolAsync("project.list_instance
 }));
 _ = Instances.GetProperty("Items");
 
+if (ExpectPostCommitFault)
+{
+    JsonElement Script = Instances.GetProperty("Items").EnumerateArray().Single(Item =>
+        Item.GetProperty("Name").GetString() == "MCP Persisted Module");
+    string ScriptId = Script.GetProperty("Id").GetProperty("Value").GetString()
+        ?? throw new InvalidOperationException("Fault-injection script identity is missing.");
+    JsonElement BeforeFault = Result(await Client.CallToolAsync("script.get_source",
+        new Dictionary<string, object?> { ["ObjectId"] = ScriptId }));
+    Stopwatch Timer = Stopwatch.StartNew();
+    var FaultedWrite = await Client.CallToolAsync("script.set_source", new Dictionary<string, object?>
+    {
+        ["ObjectId"] = ScriptId,
+        ["Source"] = "return { committed_before_projection_fault = true }\n",
+        ["ExpectedSourceRevision"] = BeforeFault.GetProperty("SourceRevision").GetInt32(),
+        ["ExpectedRevision"] = BeforeFault.GetProperty("ProjectRevision").GetInt64(),
+    });
+    Timer.Stop();
+    JsonElement FaultContent = FaultedWrite.StructuredContent
+        ?? throw new InvalidOperationException("Post-commit ScriptWrite fault returned no structured error.");
+    Require(FaultedWrite.IsError == true && ErrorCode(FaultContent) == "Unavailable",
+        "Post-commit ScriptWrite fault did not return bounded Unavailable.");
+    JsonElement CommitState = FaultContent.GetProperty("Error").GetProperty("CommitState");
+    Require(CommitState.GetProperty("AuthoritativeCommitConfirmed").GetBoolean() &&
+        CommitState.GetProperty("ProjectionUnavailable").GetBoolean() &&
+        !string.IsNullOrWhiteSpace(CommitState.GetProperty("Recommendation").GetString()) &&
+        Timer.Elapsed < TimeSpan.FromSeconds(10),
+        "Post-commit ScriptWrite fault lost commit truth or exceeded its bounded recovery deadline.");
+    Console.WriteLine($"LIVE_STUDIO_SCRIPTWRITE_POSTCOMMIT_FAULT_OK ElapsedMs={Timer.Elapsed.TotalMilliseconds:F0}");
+    return;
+}
+
 if (VerifyPersistence)
 {
     JsonElement PersistedItems = Instances.GetProperty("Items");
@@ -78,9 +120,17 @@ if (VerifyPersistence)
         Item.GetProperty("Name").GetString() == "MCP Persisted Destination");
     JsonElement Source = PersistedItems.EnumerateArray().Single(Item =>
         Item.GetProperty("Name").GetString() == "MCP Persisted Source");
+    JsonElement Script = PersistedItems.EnumerateArray().Single(Item =>
+        Item.GetProperty("Name").GetString() == "MCP Persisted Module");
     Require(Source.GetProperty("ParentId").GetProperty("Value").GetString() ==
         Destination.GetProperty("Id").GetProperty("Value").GetString(),
         "Reopened project did not preserve MCP-authored hierarchy state.");
+    string ScriptId = Script.GetProperty("Id").GetProperty("Value").GetString()
+        ?? throw new InvalidOperationException("Persisted script identity is missing.");
+    JsonElement PersistedScript = Result(await Client.CallToolAsync("script.get_source",
+        new Dictionary<string, object?> { ["ObjectId"] = ScriptId }));
+    Require(PersistedScript.GetProperty("Source").GetString() == "return { persisted = true }\n",
+        "Reopened project did not preserve exact MCP-authored script source.");
     Console.WriteLine("LIVE_STUDIO_PROJECT_WRITE_PERSISTENCE_OK");
     return;
 }
@@ -109,11 +159,18 @@ if (ProjectWrite)
 {
     JsonElement ClassPage = Classes;
     JsonElement? FolderClass = null;
+    JsonElement? ModuleScriptClass = null;
     while (true)
     {
-        FolderClass = ClassPage.GetProperty("Items").EnumerateArray().FirstOrDefault(Item =>
-            Item.GetProperty("Name").GetString() == "Folder" && Item.GetProperty("Constructible").GetBoolean());
-        if (FolderClass is { } Found && Found.ValueKind != JsonValueKind.Undefined) break;
+        JsonElement[] PageClasses = ClassPage.GetProperty("Items").EnumerateArray().ToArray();
+        if (FolderClass is null || FolderClass.Value.ValueKind == JsonValueKind.Undefined)
+            FolderClass = PageClasses.FirstOrDefault(Item =>
+                Item.GetProperty("Name").GetString() == "Folder" && Item.GetProperty("Constructible").GetBoolean());
+        if (ModuleScriptClass is null || ModuleScriptClass.Value.ValueKind == JsonValueKind.Undefined)
+            ModuleScriptClass = PageClasses.FirstOrDefault(Item =>
+                Item.GetProperty("Name").GetString() == "ModuleScript" && Item.GetProperty("Constructible").GetBoolean());
+        if (FolderClass is { ValueKind: not JsonValueKind.Undefined } &&
+            (!ScriptWrite || ModuleScriptClass is { ValueKind: not JsonValueKind.Undefined })) break;
         if (ClassPage.GetProperty("NextPageToken").ValueKind == JsonValueKind.Null) break;
         string PageToken = ClassPage.GetProperty("NextPageToken").GetString()
             ?? throw new InvalidOperationException("Schema continuation token was malformed.");
@@ -126,6 +183,10 @@ if (ProjectWrite)
     Require(FolderClass is { ValueKind: not JsonValueKind.Undefined }, "Studio schema has no constructible Folder class.");
     string FolderClassId = FolderClass.Value.GetProperty("Id").GetString()
         ?? throw new InvalidOperationException("Folder class identity is missing.");
+	string? ModuleScriptClassId = ScriptWrite
+		? ModuleScriptClass?.GetProperty("Id").GetString()
+			?? throw new InvalidOperationException("ModuleScript class identity is missing.")
+		: null;
     JsonElement Workspace = Instances.GetProperty("Items").EnumerateArray().Single(Item =>
         Item.GetProperty("ClassName").GetString() == "Workspace");
     string WorkspaceId = Workspace.GetProperty("Id").GetProperty("Value").GetString()
@@ -221,6 +282,115 @@ if (ProjectWrite)
     Require(DestinationAfterConflict.GetProperty("Name").GetString() == "MCP Persisted Destination",
         "A conflicting MCP write changed the authoritative object.");
 
+	if (ScriptWrite)
+	{
+		const string InitialSource = "return 1\n";
+		const string SecondSource = "return 2\n";
+		const string InvalidSource = "local =\n";
+		const string PersistedSource = "return { persisted = true }\n";
+		JsonElement ScriptCreate = Result(await Client.CallToolAsync("script.create", new Dictionary<string, object?>
+		{
+			["ClassId"] = ModuleScriptClassId,
+			["ParentId"] = WorkspaceId,
+			["Name"] = "MCP Persisted Module",
+			["Source"] = InitialSource,
+			["ExpectedRevision"] = Revision,
+		}));
+		string ScriptId = WriteObjectId(ScriptCreate);
+		int CreatedSourceRevision = ScriptCreate.GetProperty("SourceRevision").GetInt32();
+		Require(ScriptCreate.GetProperty("AuthoritativeCommitConfirmed").GetBoolean() &&
+			ScriptCreate.GetProperty("Diagnostics").GetArrayLength() == 0,
+			"script.create did not atomically commit the valid initial source.");
+		Revision = ScriptCreate.GetProperty("ProjectRevision").GetInt64();
+		JsonElement CreatedSource = Result(await Client.CallToolAsync("script.get_source",
+			new Dictionary<string, object?> { ["ObjectId"] = ScriptId }));
+		Require(CreatedSource.GetProperty("Source").GetString() == InitialSource &&
+			CreatedSource.GetProperty("SourceRevision").GetInt32() == CreatedSourceRevision,
+			"script.get_source did not return exact authoritative text and revision.");
+
+		JsonElement ScriptSet = Result(await Client.CallToolAsync("script.set_source", new Dictionary<string, object?>
+		{
+			["ObjectId"] = ScriptId,
+			["Source"] = SecondSource,
+			["ExpectedSourceRevision"] = CreatedSourceRevision,
+			["ExpectedRevision"] = Revision,
+		}));
+		int CurrentSourceRevision = ScriptSet.GetProperty("SourceRevision").GetInt32();
+		long RevisionBeforeSet = Revision;
+		Revision = ScriptSet.GetProperty("ProjectRevision").GetInt64();
+		Require(ScriptSet.GetProperty("AuthoritativeCommitConfirmed").GetBoolean() &&
+			!ScriptSet.GetProperty("LocalEditsConflict").GetBoolean(),
+			"script.set_source did not return authoritative confirmation.");
+
+		var StaleSource = await Client.CallToolAsync("script.set_source", new Dictionary<string, object?>
+		{
+			["ObjectId"] = ScriptId,
+			["Source"] = "return { stale_source = true }\n",
+			["ExpectedSourceRevision"] = CreatedSourceRevision,
+			["ExpectedRevision"] = Revision,
+		});
+		RequireConflict(StaleSource.StructuredContent, CurrentSourceRevision, Revision, false,
+			"Stale script source revision did not return a structured Conflict.");
+		var StaleProject = await Client.CallToolAsync("script.set_source", new Dictionary<string, object?>
+		{
+			["ObjectId"] = ScriptId,
+			["Source"] = "return { stale_project = true }\n",
+			["ExpectedSourceRevision"] = CurrentSourceRevision,
+			["ExpectedRevision"] = RevisionBeforeSet,
+		});
+		RequireConflict(StaleProject.StructuredContent, CurrentSourceRevision, Revision, false,
+			"Stale project revision did not return a structured Conflict.");
+		JsonElement AfterConflicts = Result(await Client.CallToolAsync("script.get_source",
+			new Dictionary<string, object?> { ["ObjectId"] = ScriptId }));
+		Require(AfterConflicts.GetProperty("Source").GetString() == SecondSource &&
+			AfterConflicts.GetProperty("SourceRevision").GetInt32() == CurrentSourceRevision,
+			"A stale ScriptWrite changed authoritative source.");
+
+		JsonElement InvalidSet = Result(await Client.CallToolAsync("script.set_source", new Dictionary<string, object?>
+		{
+			["ObjectId"] = ScriptId,
+			["Source"] = InvalidSource,
+			["ExpectedSourceRevision"] = CurrentSourceRevision,
+			["ExpectedRevision"] = Revision,
+		}));
+		CurrentSourceRevision = InvalidSet.GetProperty("SourceRevision").GetInt32();
+		Revision = InvalidSet.GetProperty("ProjectRevision").GetInt64();
+		Require(InvalidSet.GetProperty("Diagnostics").GetArrayLength() > 0,
+			"Syntax-invalid authored source did not return bounded diagnostics.");
+
+		JsonElement PersistedSet = Result(await Client.CallToolAsync("script.set_source", new Dictionary<string, object?>
+		{
+			["ObjectId"] = ScriptId,
+			["Source"] = PersistedSource,
+			["ExpectedSourceRevision"] = CurrentSourceRevision,
+			["ExpectedRevision"] = Revision,
+		}));
+		CurrentSourceRevision = PersistedSet.GetProperty("SourceRevision").GetInt32();
+		Revision = PersistedSet.GetProperty("ProjectRevision").GetInt64();
+		Require(PersistedSet.GetProperty("AuthoritativeCommitConfirmed").GetBoolean() &&
+			PersistedSet.GetProperty("Diagnostics").GetArrayLength() == 0,
+			"The final valid ScriptWrite did not commit cleanly after reread.");
+
+		JsonElement UndoScript = Result(await Client.CallToolAsync("studio.undo", new Dictionary<string, object?>
+		{
+			["ExpectedRevision"] = Revision,
+		}));
+		Revision = WriteRevision(UndoScript);
+		Require(Result(await Client.CallToolAsync("script.get_source",
+			new Dictionary<string, object?> { ["ObjectId"] = ScriptId }))
+			.GetProperty("Source").GetString() == InvalidSource,
+			"Manual Undo did not traverse ScriptWrite history.");
+		JsonElement RedoScript = Result(await Client.CallToolAsync("studio.redo", new Dictionary<string, object?>
+		{
+			["ExpectedRevision"] = Revision,
+		}));
+		Revision = WriteRevision(RedoScript);
+		Require(Result(await Client.CallToolAsync("script.get_source",
+			new Dictionary<string, object?> { ["ObjectId"] = ScriptId }))
+			.GetProperty("Source").GetString() == PersistedSource,
+			"Manual Redo did not traverse ScriptWrite history.");
+	}
+
     JsonElement Saved = Result(await Client.CallToolAsync("project.save", new Dictionary<string, object?>
     {
         ["ExpectedRevision"] = Revision,
@@ -267,6 +437,24 @@ static string ErrorDescription(JsonElement? StructuredContent)
     string Code = Error.TryGetProperty("Code", out JsonElement CodeNode) ? CodeNode.GetString() ?? "Unknown" : "Unknown";
     string Message = Error.TryGetProperty("Message", out JsonElement MessageNode) ? MessageNode.GetString() ?? string.Empty : string.Empty;
     return $"{Code}: {Message}";
+}
+
+static void RequireConflict(
+    JsonElement? StructuredContent,
+    int CurrentSourceRevision,
+    long CurrentProjectRevision,
+    bool LocalStudioEditsConflict,
+    string Message)
+{
+    JsonElement Content = StructuredContent
+        ?? throw new InvalidOperationException(Message);
+    Require(ErrorCode(Content) == "Conflict", Message);
+    JsonElement Details = Content.GetProperty("Error").GetProperty("Details");
+    Require(Details.GetProperty("CurrentSourceRevision").GetInt32() == CurrentSourceRevision &&
+        Details.GetProperty("CurrentProjectRevision").GetInt64() == CurrentProjectRevision &&
+        Details.GetProperty("LocalStudioEditsConflict").GetBoolean() == LocalStudioEditsConflict &&
+        !string.IsNullOrWhiteSpace(Details.GetProperty("Recommendation").GetString()),
+        Message);
 }
 
 static async Task VerifyWrongTokenAsync(string ServerAssembly, string DescriptorPath)

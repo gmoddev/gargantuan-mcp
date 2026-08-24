@@ -33,7 +33,7 @@ public sealed class StudioSessionClientTests
         {
             await File.WriteAllTextAsync(DescriptorPath, JsonSerializer.Serialize(new
             {
-                Version = 1,
+                Version = StudioSessionClient.ProtocolVersion,
                 Transport,
                 PipeName = "GargantuanStudio.Mcp.test",
                 SessionId = "gtn-studio-session-test",
@@ -60,7 +60,7 @@ public sealed class StudioSessionClientTests
         {
             await File.WriteAllTextAsync(DescriptorPath, JsonSerializer.Serialize(new
             {
-                Version = 1,
+                Version = StudioSessionClient.ProtocolVersion,
                 Transport = "windows-named-pipe",
                 PipeName = "GargantuanStudio.Mcp." + Guid.NewGuid().ToString("N"),
                 SessionId = "gtn-studio-session-test",
@@ -90,7 +90,7 @@ public sealed class StudioSessionClientTests
         string OutsideDescriptor = Path.Combine(OutsideRoot, "session.json");
         await File.WriteAllTextAsync(OutsideDescriptor, JsonSerializer.Serialize(new
         {
-            Version = 1,
+            Version = StudioSessionClient.ProtocolVersion,
             Transport = "windows-named-pipe",
             PipeName = "GargantuanStudio.Mcp.test",
             SessionId = "gtn-studio-session-test",

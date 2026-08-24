@@ -13,6 +13,7 @@ public sealed class StudioGargantuanAdapter : IGargantuanAdapter
     private const int MaximumInheritanceDepth = 128;
     private const int MaximumPaginationOffset = 1_000_000;
     private const string IdentityPrefix = "gtn_studio_";
+    private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
     private readonly IStudioSessionClient Client;
     private readonly StudioIdentityMap Identities = new();
@@ -36,6 +37,8 @@ public sealed class StudioGargantuanAdapter : IGargantuanAdapter
                 StudioBridgeCapability.SelectionInspection => AdapterCapability.SelectionInspection,
                 StudioBridgeCapability.SelectionWrite => AdapterCapability.SelectionWrite,
                 StudioBridgeCapability.ProjectWrite => AdapterCapability.ProjectWrite,
+                StudioBridgeCapability.ScriptInspection => AdapterCapability.ScriptInspection,
+                StudioBridgeCapability.ScriptWrite => AdapterCapability.ScriptWrite,
                 _ => throw new GargantuanAdapterException(GargantuanErrorCode.InternalError, "Studio advertised an unsupported capability."),
             });
         }
@@ -285,6 +288,64 @@ public sealed class StudioGargantuanAdapter : IGargantuanAdapter
     public Task<ProjectWriteResult> RedoAsync(ProjectRevisionRequest Request, CancellationToken CancellationToken) =>
         InvokeRevisionWriteAsync(Request, Client.RedoAsync, CancellationToken);
 
+    public Task<ScriptSourceResult> GetScriptSourceAsync(
+        ObjectIdentity ObjectId,
+        CancellationToken CancellationToken)
+    {
+        RequireCapability(AdapterCapability.ScriptInspection);
+        StudioObjectIdentity StudioId = Identities.GetStudioIdentity(ObjectId);
+        return InvokeAsync(
+            AdapterCapability.ScriptInspection,
+            async () => ConvertScriptSource(
+                await Client.GetScriptSourceAsync(StudioId, CancellationToken).ConfigureAwait(false),
+                StudioId),
+            CancellationToken);
+    }
+
+    public Task<ScriptWriteResult> CreateScriptAsync(
+        CreateScriptRequest Request,
+        CancellationToken CancellationToken)
+    {
+        RequireCapability(AdapterCapability.ProjectWrite);
+        RequireCapability(AdapterCapability.ScriptWrite);
+        ValidateExpectedRevision(Request.ExpectedRevision);
+        ValidateClassId(Request.ClassId);
+        StudioCreateScriptRequest BridgeRequest = new(
+            Request.ClassId,
+            Identities.GetStudioIdentity(Request.ParentId),
+            RequireInputText(Request.Name, "Script name", McpLimits.MaximumScriptNameBytes, AllowEmpty: false),
+            RequireInputText(Request.Source, "Script source", McpLimits.MaximumScriptSourceBytes, AllowEmpty: true),
+            Request.ExpectedRevision);
+        ValidateScriptWriteRequestSize(BridgeRequest);
+        return InvokeScriptWriteAsync(
+            () => Client.CreateScriptAsync(BridgeRequest, CancellationToken),
+            null,
+            CancellationToken);
+    }
+
+    public Task<ScriptWriteResult> SetScriptSourceAsync(
+        SetScriptSourceRequest Request,
+        CancellationToken CancellationToken)
+    {
+        RequireCapability(AdapterCapability.ProjectWrite);
+        RequireCapability(AdapterCapability.ScriptWrite);
+        ValidateExpectedRevision(Request.ExpectedRevision);
+        if (Request.ExpectedSourceRevision <= 0)
+            throw Error(GargantuanErrorCode.InvalidArgument,
+                "ExpectedSourceRevision must be a positive script source revision.");
+        StudioObjectIdentity StudioId = Identities.GetStudioIdentity(Request.ObjectId);
+        StudioSetScriptSourceRequest BridgeRequest = new(
+            StudioId,
+            RequireInputText(Request.Source, "Script source", McpLimits.MaximumScriptSourceBytes, AllowEmpty: true),
+            Request.ExpectedSourceRevision,
+            Request.ExpectedRevision);
+        ValidateScriptWriteRequestSize(BridgeRequest);
+        return InvokeScriptWriteAsync(
+            () => Client.SetScriptSourceAsync(BridgeRequest, CancellationToken),
+            StudioId,
+            CancellationToken);
+    }
+
     private Task<ProjectWriteResult> InvokeRevisionWriteAsync(
         ProjectRevisionRequest Request,
         Func<StudioProjectRevisionRequest, CancellationToken, Task<StudioProjectWriteResult>> Operation,
@@ -318,6 +379,61 @@ public sealed class StudioGargantuanAdapter : IGargantuanAdapter
             Result.PersistedRevision,
             Result.Dirty,
             OptionalBridgeString(Result.HistoryLabel, nameof(Result.HistoryLabel)),
+            Diagnostics);
+    }
+
+    private ScriptSourceResult ConvertScriptSource(
+        StudioScriptSourceResult Result,
+        StudioObjectIdentity ExpectedObject)
+    {
+        ValidateNativeIdentity(Result.ObjectId);
+        if (Result.ObjectId != ExpectedObject || Result.SourceRevision <= 0 || Result.ProjectRevision <= 0)
+            throw BridgeContractError("Studio returned an invalid script source identity or revision.");
+        return new ScriptSourceResult(
+            Identities.GetMcpIdentity(Result.ObjectId),
+            RequireBridgeString(Result.ClassName, nameof(Result.ClassName)),
+            RequireBridgeText(Result.Source, nameof(Result.Source), McpLimits.MaximumScriptSourceBytes, AllowEmpty: true),
+            Result.SourceRevision,
+            Result.ProjectRevision);
+    }
+
+    private Task<ScriptWriteResult> InvokeScriptWriteAsync(
+        Func<Task<StudioScriptWriteResult>> Operation,
+        StudioObjectIdentity? ExpectedObject,
+        CancellationToken CancellationToken) => InvokeAsync(
+        AdapterCapability.ScriptWrite,
+        async () => ConvertScriptWriteResult(await Operation().ConfigureAwait(false), ExpectedObject),
+        CancellationToken);
+
+    private ScriptWriteResult ConvertScriptWriteResult(
+        StudioScriptWriteResult Result,
+        StudioObjectIdentity? ExpectedObject)
+    {
+        ValidateNativeIdentity(Result.ObjectId);
+        if (ExpectedObject is { } Expected && Result.ObjectId != Expected ||
+            Result.SourceRevision <= 0 || Result.ProjectRevision <= 0 ||
+            !Result.AuthoritativeCommitConfirmed || Result.Diagnostics is null ||
+            Result.Diagnostics.Count > McpLimits.MaximumScriptDiagnostics)
+            throw BridgeContractError("Studio returned an invalid ScriptWrite result.");
+        ScriptDiagnostic[] Diagnostics = Result.Diagnostics.Select(Item =>
+        {
+            if (Item.Line <= 0 || Item.Column <= 0 ||
+                string.IsNullOrWhiteSpace(Item.Message) ||
+                Item.Message.Length > McpLimits.MaximumScriptDiagnosticMessageCharacters)
+                throw BridgeContractError("Studio returned an invalid bounded script diagnostic.");
+            return new ScriptDiagnostic(
+                RequireBridgeString(Item.Code, nameof(Item.Code)),
+                Item.Message,
+                Item.Line,
+                Item.Column);
+        }).ToArray();
+        return new ScriptWriteResult(
+            Identities.GetMcpIdentity(Result.ObjectId),
+            RequireBridgeString(Result.ClassName, nameof(Result.ClassName)),
+            Result.SourceRevision,
+            Result.ProjectRevision,
+            true,
+            Result.LocalEditsConflict,
             Diagnostics);
     }
 
@@ -444,6 +560,51 @@ public sealed class StudioGargantuanAdapter : IGargantuanAdapter
         return Value;
     }
 
+    private static string RequireInputText(
+        string Value,
+        string Name,
+        int MaximumBytes,
+        bool AllowEmpty)
+    {
+        if (Value is null || Value.Contains('\0') || !AllowEmpty && string.IsNullOrWhiteSpace(Value))
+            throw Error(GargantuanErrorCode.InvalidArgument, $"{Name} is invalid.");
+        try
+        {
+            if (StrictUtf8.GetByteCount(Value) > MaximumBytes)
+                throw Error(GargantuanErrorCode.ResourceLimit,
+                    $"{Name} exceeds its {MaximumBytes}-byte UTF-8 bound.");
+        }
+        catch (EncoderFallbackException Exception)
+        {
+            throw new GargantuanAdapterException(
+                GargantuanErrorCode.InvalidArgument,
+                $"{Name} is not valid UTF-8 text.",
+                Exception);
+        }
+        return Value;
+    }
+
+    private static string RequireBridgeText(
+        string Value,
+        string Name,
+        int MaximumBytes,
+        bool AllowEmpty)
+    {
+        if (Value is null || Value.Contains('\0') || !AllowEmpty && string.IsNullOrWhiteSpace(Value))
+            throw BridgeContractError($"Studio returned invalid {Name}.");
+        try
+        {
+            if (StrictUtf8.GetByteCount(Value) > MaximumBytes)
+                throw Error(GargantuanErrorCode.ResourceLimit,
+                    $"Studio {Name} exceeds the MCP byte bound.");
+        }
+        catch (EncoderFallbackException)
+        {
+            throw BridgeContractError($"Studio returned non-UTF-8 {Name}.");
+        }
+        return Value;
+    }
+
     private static void ValidateExpectedRevision(long? ExpectedRevision)
     {
         if (ExpectedRevision is <= 0)
@@ -454,6 +615,13 @@ public sealed class StudioGargantuanAdapter : IGargantuanAdapter
     {
         if (JsonSerializer.SerializeToUtf8Bytes(Request).Length > McpLimits.MaximumProjectWriteRequestBytes)
             throw Error(GargantuanErrorCode.ResourceLimit, "ProjectWrite request exceeds its encoded byte bound.");
+    }
+
+    private static void ValidateScriptWriteRequestSize<T>(T Request)
+    {
+        if (JsonSerializer.SerializeToUtf8Bytes(Request).Length > McpLimits.MaximumScriptWriteRequestBytes)
+            throw Error(GargantuanErrorCode.ResourceLimit,
+                "ScriptWrite request exceeds its encoded byte bound.");
     }
 
     private async Task<T> InvokeAsync<T>(AdapterCapability Capability, Func<Task<T>> Operation, CancellationToken CancellationToken)
@@ -693,7 +861,41 @@ public sealed class StudioGargantuanAdapter : IGargantuanAdapter
         string Message = Code == GargantuanErrorCode.InternalError
             ? "The Studio bridge operation failed."
             : BoundSafeMessage(Exception.SafeMessage);
-        return new GargantuanAdapterException(Code, Message, Exception);
+        ScriptConflictDetails? ConflictDetails = null;
+        if (Exception.ConflictDetails is { } Details)
+        {
+            if (Code != GargantuanErrorCode.Conflict ||
+                Details.CurrentSourceRevision is <= 0 || Details.CurrentProjectRevision is <= 0 ||
+                string.IsNullOrWhiteSpace(Details.Recommendation) ||
+                Details.Recommendation.Length > MaximumSafeMessageLength)
+                return new GargantuanAdapterException(
+                    GargantuanErrorCode.InternalError,
+                    "The Studio bridge returned invalid conflict details.",
+                    Exception);
+            ConflictDetails = new ScriptConflictDetails(
+                Details.CurrentSourceRevision,
+                Details.CurrentProjectRevision,
+                Details.LocalStudioEditsConflict,
+                BoundSafeMessage(Details.Recommendation));
+        }
+        ScriptCommitState? CommitState = null;
+        if (Exception.CommitState is { } BridgeCommitState)
+        {
+            if (Code != GargantuanErrorCode.Unavailable ||
+                !BridgeCommitState.AuthoritativeCommitConfirmed ||
+                !BridgeCommitState.ProjectionUnavailable ||
+                string.IsNullOrWhiteSpace(BridgeCommitState.Recommendation) ||
+                BridgeCommitState.Recommendation.Length > MaximumSafeMessageLength)
+                return new GargantuanAdapterException(
+                    GargantuanErrorCode.InternalError,
+                    "The Studio bridge returned invalid committed projection state.",
+                    Exception);
+            CommitState = new ScriptCommitState(
+                true,
+                true,
+                BoundSafeMessage(BridgeCommitState.Recommendation));
+        }
+        return new GargantuanAdapterException(Code, Message, Exception, ConflictDetails, CommitState);
     }
 
     private static string BoundSafeMessage(string Message)

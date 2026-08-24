@@ -27,6 +27,15 @@ public static class ToolRegistrationPolicy
         Policy.Evaluate(ToolRiskClass.ProjectWrite) == PolicyDecision.Allow &&
         Descriptor.Capabilities.Contains(AdapterCapability.ProjectWrite);
 
+    public static bool CanAdvertiseScriptRead(AdapterDescriptor Descriptor, LocalToolPolicy Policy) =>
+        Policy.Evaluate(ToolRiskClass.Read) == PolicyDecision.Allow &&
+        Descriptor.Capabilities.Contains(AdapterCapability.ScriptInspection);
+
+    public static bool CanAdvertiseScriptWrite(AdapterDescriptor Descriptor, LocalToolPolicy Policy) =>
+        CanAdvertiseProjectWrite(Descriptor, Policy) &&
+        Policy.Evaluate(ToolRiskClass.ScriptWrite) == PolicyDecision.Allow &&
+        Descriptor.Capabilities.Contains(AdapterCapability.ScriptWrite);
+
     public static bool CanAdvertiseDestructiveWrite(AdapterDescriptor Descriptor, LocalToolPolicy Policy) =>
         CanAdvertiseProjectWrite(Descriptor, Policy) &&
         Policy.Evaluate(ToolRiskClass.DestructiveWrite) == PolicyDecision.Allow;
@@ -83,22 +92,50 @@ public sealed class ProjectWriteTools(IGargantuanAdapter Adapter, ToolExecutor E
     public Task<ToolResponse<ProjectWriteResult>> Redo(long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
         ExecuteAsync(Token => Adapter.RedoAsync(new(ExpectedRevision), Token), CancellationToken);
 
-    private async Task<ToolResponse<ProjectWriteResult>> ExecuteAsync(
-        Func<CancellationToken, Task<ProjectWriteResult>> Operation,
+    public Task<ToolResponse<ScriptWriteResult>> CreateScript(
+        string ClassId,
+        string ParentId,
+        string Name,
+        string Source,
+        long? ExpectedRevision = null,
+        CancellationToken CancellationToken = default) =>
+        ExecuteAsync(Token => Adapter.CreateScriptAsync(new(
+            ClassId, new(ParentId), Name, Source, ExpectedRevision), Token),
+            CancellationToken,
+            ToolRiskClass.ScriptWrite);
+
+    public Task<ToolResponse<ScriptWriteResult>> SetScriptSource(
+        string ObjectId,
+        string Source,
+        int ExpectedSourceRevision,
+        long? ExpectedRevision = null,
+        CancellationToken CancellationToken = default) =>
+        ExecuteAsync(Token => Adapter.SetScriptSourceAsync(new(
+            new(ObjectId), Source, ExpectedSourceRevision, ExpectedRevision), Token),
+            CancellationToken,
+            ToolRiskClass.ScriptWrite);
+
+    private async Task<ToolResponse<T>> ExecuteAsync<T>(
+        Func<CancellationToken, Task<T>> Operation,
         CancellationToken CancellationToken,
         ToolRiskClass RiskClass = ToolRiskClass.ProjectWrite)
     {
         if (Policy.Evaluate(ToolRiskClass.ProjectWrite) != PolicyDecision.Allow)
-            return ToolResponse<ProjectWriteResult>.Fail(
+            return ToolResponse<T>.Fail(
                 GargantuanErrorCode.PermissionDenied,
                 "Durable project writes are not allowed by server policy.");
-        if (RiskClass != ToolRiskClass.ProjectWrite &&
-            Policy.Evaluate(RiskClass) != PolicyDecision.Allow)
-            return ToolResponse<ProjectWriteResult>.Fail(
+        if (RiskClass == ToolRiskClass.ScriptWrite &&
+            Policy.Evaluate(ToolRiskClass.ScriptWrite) != PolicyDecision.Allow)
+            return ToolResponse<T>.Fail(
+                GargantuanErrorCode.PermissionDenied,
+                "ScriptWrite is not allowed by server policy.");
+        if (RiskClass == ToolRiskClass.DestructiveWrite &&
+            Policy.Evaluate(ToolRiskClass.DestructiveWrite) != PolicyDecision.Allow)
+            return ToolResponse<T>.Fail(
                 GargantuanErrorCode.PermissionDenied,
                 "Destructive project writes are not allowed by server policy.");
         if (!await Concurrency.WaitAsync(0, CancellationToken).ConfigureAwait(false))
-            return ToolResponse<ProjectWriteResult>.Fail(
+            return ToolResponse<T>.Fail(
                 GargantuanErrorCode.ResourceLimit,
                 "Another MCP ProjectWrite operation is already in progress.");
         try
@@ -110,6 +147,16 @@ public sealed class ProjectWriteTools(IGargantuanAdapter Adapter, ToolExecutor E
             Concurrency.Release();
         }
     }
+}
+
+public sealed class ScriptReadTools(IGargantuanAdapter Adapter, ToolExecutor Executor)
+{
+    public Task<ToolResponse<ScriptSourceResult>> GetSource(
+        string ObjectId,
+        CancellationToken CancellationToken = default) =>
+        Executor.ExecuteAsync(
+            Token => Adapter.GetScriptSourceAsync(new(ObjectId), Token),
+            CancellationToken);
 }
 
 public sealed class ReadTools(IGargantuanAdapter Adapter, ToolExecutor Executor)
@@ -232,6 +279,42 @@ public sealed class McpProjectWriteTools(ProjectWriteTools Tools)
     [Description("Redoes the current document session's next authoritative history entry using the same Studio/EditorHost history used by manual commands.")]
     public async Task<CallToolResult> Redo(long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
         ToolExecutor.ToMcpResult(await Tools.Redo(ExpectedRevision, CancellationToken));
+}
+
+public sealed class McpScriptReadTools(ScriptReadTools Tools)
+{
+    [McpServerTool(Name = "script.get_source", ReadOnly = true, OpenWorld = false, UseStructuredContent = true, OutputSchemaType = typeof(ToolResponse<ScriptSourceResult>))]
+    [Description("Returns exact authoritative source and source/project revisions for one supported script identity. Source is bounded to 65536 UTF-8 bytes.")]
+    public async Task<CallToolResult> GetSource(
+        string ObjectId,
+        CancellationToken CancellationToken = default) =>
+        ToolExecutor.ToMcpResult(await Tools.GetSource(ObjectId, CancellationToken));
+}
+
+public sealed class McpScriptWriteTools(ProjectWriteTools Tools)
+{
+    [McpServerTool(Name = "script.create", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false, UseStructuredContent = true, OutputSchemaType = typeof(ToolResponse<ScriptWriteResult>))]
+    [Description("Atomically creates one supported LuaSourceContainer with exact initial source through Studio's authoritative command/history pipeline. It does not execute or enable the script; invalid Luau is committed with bounded syntax diagnostics.")]
+    public async Task<CallToolResult> Create(
+        string ClassId,
+        string ParentId,
+        string Name,
+        string Source,
+        long? ExpectedRevision = null,
+        CancellationToken CancellationToken = default) =>
+        ToolExecutor.ToMcpResult(await Tools.CreateScript(
+            ClassId, ParentId, Name, Source, ExpectedRevision, CancellationToken));
+
+    [McpServerTool(Name = "script.set_source", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false, UseStructuredContent = true, OutputSchemaType = typeof(ToolResponse<ScriptWriteResult>))]
+    [Description("Commits exact source to one supported script using mandatory ExpectedSourceRevision and optional ExpectedRevision checks. It rejects uncommitted Studio buffers, never executes code, and returns bounded syntax diagnostics after authoritative confirmation.")]
+    public async Task<CallToolResult> SetSource(
+        string ObjectId,
+        string Source,
+        int ExpectedSourceRevision,
+        long? ExpectedRevision = null,
+        CancellationToken CancellationToken = default) =>
+        ToolExecutor.ToMcpResult(await Tools.SetScriptSource(
+            ObjectId, Source, ExpectedSourceRevision, ExpectedRevision, CancellationToken));
 }
 
 public sealed class McpDestructiveWriteTools(ProjectWriteTools Tools)
