@@ -82,8 +82,20 @@ Only explicitly safe, bounded messages may accompany non-internal errors. Intern
 
 Studio is explicitly launched with `--mcp-bridge-descriptor <absolute LocalApplicationData path>`. MCP is separately launched with `--studio-bridge-descriptor <the same path>`. Normal launches expose no Studio bridge, and normal MCP launches remain mock-backed.
 
-The descriptor is protocol version 1 with exact `Transport`, `PipeName`, `SessionId`, `Token`, and `ProcessId` fields. Transport is `windows-named-pipe`; token is 256 random bits. The descriptor is read once and is never a discovery directory or reattachment mechanism.
+The descriptor is protocol version 1 with exact `Transport`, `PipeName`, `SessionId`, `Token`, and `ProcessId` fields. Transport is `windows-named-pipe`; token is 256 random bits. Its absolute path must remain below `LocalApplicationData`, and the root, every existing parent component, and the leaf must not be a symbolic link or Windows reparse point. The descriptor is read once and is never a discovery directory or reattachment mechanism.
 
 Each request uses one `CurrentUserOnly` Windows byte-mode named-pipe connection and one four-byte little-endian length-prefixed UTF-8 JSON request/response. The authenticated envelope contains exact `Version`, `RequestId`, `SessionId`, `Token`, `Method`, and `Parameters` fields. The implemented bounds are 64 KiB request, 1 MiB response, JSON depth 32, four client operations, one concurrent ProjectWrite, 20 ProjectWrite starts per rolling second per Studio session, 48 KiB serialized ProjectWrite DTO, 32 create-initialization properties, 16 KiB UTF-8 property strings, five-second connection establishment, and 30-second request completion. Write results return at most eight safe diagnostics.
 
 The client validates version, transport, all descriptor fields, token size, frame sizes, response version/request ID, exact response shape, semantic DTOs, and closed errors. It never logs the token. Both Studio and MCP must explicitly opt into ProjectWrite (`--allow-mcp-project-write` and `--allow-project-write` respectively); live bridge existence alone is insufficient. Cancellation closes the connection; disconnect, timeout, Studio exit, and replacement fail as bounded `Unavailable`.
+
+## Deferred bridge conformance artifact
+
+The real `Gargantuan.Mcp.LiveStudioSmoke` proves matching builds end to end, but
+Studio and MCP still duplicate bridge method, error, and limit constants. A
+separate contract-release milestone should have Studio publish
+`contracts/studio-mcp-bridge-v1.json` containing the descriptor/envelope version,
+method names, closed error codes, request/response schema hashes, capability
+mapping, and every frame/operation/resource limit, together with canonical JSON
+vectors. MCP should pin the artifact to its supported Studio release and compare
+its DTO serialization and constants in CI. The artifact remains data-only and
+does not authorize calls or introduce a Studio assembly dependency.

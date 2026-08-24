@@ -25,7 +25,11 @@ List<string> ServerArguments =
     "--studio-bridge-descriptor", DescriptorPath,
     "--allow-studio-local-write",
 ];
-if (ProjectWrite) ServerArguments.Add("--allow-project-write");
+if (ProjectWrite)
+{
+    ServerArguments.Add("--allow-project-write");
+    ServerArguments.Add("--allow-destructive-write");
+}
 StdioClientTransport Transport = new(new StdioClientTransportOptions
 {
     Name = "Gargantuan MCP live Studio smoke",

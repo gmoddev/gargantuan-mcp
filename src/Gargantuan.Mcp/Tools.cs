@@ -26,6 +26,10 @@ public static class ToolRegistrationPolicy
     public static bool CanAdvertiseProjectWrite(AdapterDescriptor Descriptor, LocalToolPolicy Policy) =>
         Policy.Evaluate(ToolRiskClass.ProjectWrite) == PolicyDecision.Allow &&
         Descriptor.Capabilities.Contains(AdapterCapability.ProjectWrite);
+
+    public static bool CanAdvertiseDestructiveWrite(AdapterDescriptor Descriptor, LocalToolPolicy Policy) =>
+        CanAdvertiseProjectWrite(Descriptor, Policy) &&
+        Policy.Evaluate(ToolRiskClass.DestructiveWrite) == PolicyDecision.Allow;
 }
 
 public sealed class ProjectWriteTools(IGargantuanAdapter Adapter, ToolExecutor Executor, LocalToolPolicy Policy)
@@ -46,7 +50,8 @@ public sealed class ProjectWriteTools(IGargantuanAdapter Adapter, ToolExecutor E
         bool DeleteSubtree,
         long? ExpectedRevision = null,
         CancellationToken CancellationToken = default) =>
-        ExecuteAsync(Token => Adapter.DeleteInstanceAsync(new(new(ObjectId), DeleteSubtree, ExpectedRevision), Token), CancellationToken);
+        ExecuteAsync(Token => Adapter.DeleteInstanceAsync(new(new(ObjectId), DeleteSubtree, ExpectedRevision), Token),
+            CancellationToken, ToolRiskClass.DestructiveWrite);
 
     public Task<ToolResponse<ProjectWriteResult>> Duplicate(
         string ObjectId,
@@ -80,12 +85,18 @@ public sealed class ProjectWriteTools(IGargantuanAdapter Adapter, ToolExecutor E
 
     private async Task<ToolResponse<ProjectWriteResult>> ExecuteAsync(
         Func<CancellationToken, Task<ProjectWriteResult>> Operation,
-        CancellationToken CancellationToken)
+        CancellationToken CancellationToken,
+        ToolRiskClass RiskClass = ToolRiskClass.ProjectWrite)
     {
         if (Policy.Evaluate(ToolRiskClass.ProjectWrite) != PolicyDecision.Allow)
             return ToolResponse<ProjectWriteResult>.Fail(
                 GargantuanErrorCode.PermissionDenied,
                 "Durable project writes are not allowed by server policy.");
+        if (RiskClass != ToolRiskClass.ProjectWrite &&
+            Policy.Evaluate(RiskClass) != PolicyDecision.Allow)
+            return ToolResponse<ProjectWriteResult>.Fail(
+                GargantuanErrorCode.PermissionDenied,
+                "Destructive project writes are not allowed by server policy.");
         if (!await Concurrency.WaitAsync(0, CancellationToken).ConfigureAwait(false))
             return ToolResponse<ProjectWriteResult>.Fail(
                 GargantuanErrorCode.ResourceLimit,
@@ -189,12 +200,6 @@ public sealed class McpProjectWriteTools(ProjectWriteTools Tools)
         long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
         ToolExecutor.ToMcpResult(await Tools.Create(ClassId, ParentId, InitialProperties, ExpectedRevision, CancellationToken));
 
-    [McpServerTool(Name = "instance.delete", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false, UseStructuredContent = true, OutputSchemaType = typeof(ToolResponse<ProjectWriteResult>))]
-    [Description("Deletes exactly the opaque target and its full descendant subtree through Studio history. DeleteSubtree must be true to acknowledge descendant deletion; root/protected/stale targets are rejected.")]
-    public async Task<CallToolResult> Delete(string ObjectId, bool DeleteSubtree,
-        long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
-        ToolExecutor.ToMcpResult(await Tools.Delete(ObjectId, DeleteSubtree, ExpectedRevision, CancellationToken));
-
     [McpServerTool(Name = "instance.duplicate", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false, UseStructuredContent = true, OutputSchemaType = typeof(ToolResponse<ProjectWriteResult>))]
     [Description("Duplicates the opaque source and all descendants using Studio's ordinary authoritative duplicate semantics. The duplicate is placed beside its source and receives fresh identities.")]
     public async Task<CallToolResult> Duplicate(string ObjectId,
@@ -227,4 +232,13 @@ public sealed class McpProjectWriteTools(ProjectWriteTools Tools)
     [Description("Redoes the current document session's next authoritative history entry using the same Studio/EditorHost history used by manual commands.")]
     public async Task<CallToolResult> Redo(long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
         ToolExecutor.ToMcpResult(await Tools.Redo(ExpectedRevision, CancellationToken));
+}
+
+public sealed class McpDestructiveWriteTools(ProjectWriteTools Tools)
+{
+    [McpServerTool(Name = "instance.delete", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false, UseStructuredContent = true, OutputSchemaType = typeof(ToolResponse<ProjectWriteResult>))]
+    [Description("Deletes exactly the opaque target and its full descendant subtree through Studio history. DeleteSubtree must be true to acknowledge descendant deletion; root/protected/stale targets are rejected.")]
+    public async Task<CallToolResult> Delete(string ObjectId, bool DeleteSubtree,
+        long? ExpectedRevision = null, CancellationToken CancellationToken = default) =>
+        ToolExecutor.ToMcpResult(await Tools.Delete(ObjectId, DeleteSubtree, ExpectedRevision, CancellationToken));
 }

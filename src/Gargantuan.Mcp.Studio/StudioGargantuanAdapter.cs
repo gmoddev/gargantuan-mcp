@@ -99,7 +99,8 @@ public sealed class StudioGargantuanAdapter : IGargantuanAdapter
         ValidateOptionalQuery(Request.NameQuery, nameof(Request.NameQuery));
 
         StudioObjectIdentity? ParentId = Request.ParentId is { } McpParent ? Identities.GetStudioIdentity(McpParent) : null;
-        string Scope = GetScope("instances", Request.ParentId?.Value ?? string.Empty, Request.RecursiveDepth.ToString(CultureInfo.InvariantCulture), Request.ClassFilter ?? string.Empty, Request.NameQuery ?? string.Empty);
+        string Scope = GetScope("instances", Request.ParentId?.Value,
+            Request.RecursiveDepth.ToString(CultureInfo.InvariantCulture), Request.ClassFilter, Request.NameQuery);
         PageCursor Cursor = DecodePageToken(Request.PageToken, Scope);
         StudioListInstancesRequest BridgeRequest = new(
             ParentId, Request.RecursiveDepth, Request.ClassFilter, Request.NameQuery,
@@ -602,10 +603,30 @@ public sealed class StudioGargantuanAdapter : IGargantuanAdapter
             throw BridgeContractError("Studio returned an invalid object identity.");
     }
 
-    private string GetScope(params string[] Values)
+    private string GetScope(params string?[] Values)
     {
-        string Input = string.Join('\u001f', new[] { SessionId }.Concat(Values));
-        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Input)))[..24];
+        using MemoryStream Canonical = new();
+        using (BinaryWriter Writer = new(Canonical, Encoding.UTF8, true))
+        {
+            Writer.Write(1);
+            WriteScopeValue(Writer, "Gargantuan.Mcp.PageScope");
+            Writer.Write(checked(Values.Length + 1));
+            WriteScopeValue(Writer, SessionId);
+            foreach (string? Value in Values) WriteScopeValue(Writer, Value);
+        }
+        return Convert.ToHexString(SHA256.HashData(Canonical.GetBuffer().AsSpan(0, checked((int)Canonical.Length))));
+    }
+
+    private static void WriteScopeValue(BinaryWriter Writer, string? Value)
+    {
+        if (Value is null)
+        {
+            Writer.Write(-1);
+            return;
+        }
+        byte[] Bytes = Encoding.UTF8.GetBytes(Value);
+        Writer.Write(Bytes.Length);
+        Writer.Write(Bytes);
     }
 
     private PageCursor DecodePageToken(string? Token, string Scope)
@@ -616,7 +637,7 @@ public sealed class StudioGargantuanAdapter : IGargantuanAdapter
         {
             string Value = Encoding.UTF8.GetString(Convert.FromBase64String(Token));
             string[] Parts = Value.Split(':');
-            if (Parts.Length != 4 || Parts[0] != "1" || Parts[1] != Scope ||
+            if (Parts.Length != 4 || Parts[0] != "2" || Parts[1] != Scope ||
                 !ulong.TryParse(Parts[2], NumberStyles.None, CultureInfo.InvariantCulture, out ulong SnapshotVersion) ||
                 !int.TryParse(Parts[3], NumberStyles.None, CultureInfo.InvariantCulture, out int Offset) ||
                 Offset is < 0 or > MaximumPaginationOffset)
@@ -635,7 +656,7 @@ public sealed class StudioGargantuanAdapter : IGargantuanAdapter
     {
         if (Cursor.SnapshotVersion is not { } SnapshotVersion)
             throw BridgeContractError("Studio page did not provide a snapshot version.");
-        string Value = $"1:{Scope}:{SnapshotVersion.ToString(CultureInfo.InvariantCulture)}:{Cursor.Offset.ToString(CultureInfo.InvariantCulture)}";
+        string Value = $"2:{Scope}:{SnapshotVersion.ToString(CultureInfo.InvariantCulture)}:{Cursor.Offset.ToString(CultureInfo.InvariantCulture)}";
         return Convert.ToBase64String(Encoding.UTF8.GetBytes(Value));
     }
 

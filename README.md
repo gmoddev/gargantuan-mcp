@@ -47,10 +47,11 @@ GargantuanStudio --engine <engine> --project <project> `
 dotnet Gargantuan.Mcp.dll `
   --studio-bridge-descriptor <absolute-LocalApplicationData-session.json> `
   --allow-studio-local-write `
-  --allow-project-write
+  --allow-project-write `
+  --allow-destructive-write
 ```
 
-Omit `--allow-studio-local-write` to keep `studio.set_selection` out of discovery. Omit either ProjectWrite switch to keep all durable-write tools out of discovery. MCP reads only the supplied descriptor; it never searches LocalApplicationData or scans processes. One MCP process remains bound to the descriptor's immutable pipe, session ID, token, capability set, and object-identity scope and never reattaches to a replacement session.
+Omit `--allow-studio-local-write` to keep `studio.set_selection` out of discovery. Omit either ProjectWrite switch to keep all durable-write tools out of discovery. `instance.delete` additionally requires `--allow-destructive-write`; without it the seven non-destructive ProjectWrite tools remain available while deletion is absent. MCP reads only the supplied descriptor; it never searches LocalApplicationData or scans processes. One MCP process remains bound to the descriptor's immutable pipe, session ID, token, capability set, and object-identity scope and never reattaches to a replacement session.
 
 ## Current tools
 
@@ -65,7 +66,7 @@ Omit `--allow-studio-local-write` to keep `studio.set_selection` out of discover
 | `studio.get_selection` | Read | enabled | Current Studio-local selection |
 | `studio.set_selection` | StudioLocalWrite | opt-in | Mock/Studio-local selection only |
 | `instance.create` | ProjectWrite | opt-in | Atomically create one schema-valid instance with up to 32 initial properties |
-| `instance.delete` | ProjectWrite | opt-in | Delete an explicitly acknowledged target subtree |
+| `instance.delete` | ProjectWrite + DestructiveWrite | separately opt-in | Delete an explicitly acknowledged target subtree |
 | `instance.duplicate` | ProjectWrite | opt-in | Use Studio's ordinary authoritative subtree duplicate semantics |
 | `instance.reparent` | ProjectWrite | opt-in | Reparent one live identity after parent/cycle validation |
 | `instance.set_property` | ProjectWrite | opt-in | Set one schema-writable native, custom, or extension property |

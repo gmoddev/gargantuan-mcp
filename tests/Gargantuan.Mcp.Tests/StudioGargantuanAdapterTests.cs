@@ -80,6 +80,33 @@ public sealed class StudioGargantuanAdapterTests
     }
 
     [Fact]
+    public async Task PaginationScopeEncodingIsInjectiveForCallerControlledText()
+    {
+        const char Delimiter = '\u001f';
+        FakeStudioSessionClient Client = new(FakeStudioSessionClient.AllCapabilities);
+        StudioGargantuanAdapter Adapter = await StudioGargantuanAdapter.CreateAsync(Client);
+
+        PagedResult<InstanceSummary> Delimited = await Adapter.ListInstancesAsync(
+            new(null, 2, $"left{Delimiter}right", "", null, 2), default);
+        Assert.NotNull(Delimited.NextPageToken);
+        GargantuanAdapterException DelimiterCollision = await Assert.ThrowsAsync<GargantuanAdapterException>(() =>
+            Adapter.ListInstancesAsync(new(null, 2, "left", $"right{Delimiter}", Delimited.NextPageToken, 2), default));
+        Assert.Equal(GargantuanErrorCode.InvalidArgument, DelimiterCollision.Code);
+
+        PagedResult<InstanceSummary> NullScoped = await Adapter.ListInstancesAsync(
+            new(null, 2, null, null, null, 2), default);
+        GargantuanAdapterException NullEmptyCollision = await Assert.ThrowsAsync<GargantuanAdapterException>(() =>
+            Adapter.ListInstancesAsync(new(null, 2, "", null, NullScoped.NextPageToken, 2), default));
+        Assert.Equal(GargantuanErrorCode.InvalidArgument, NullEmptyCollision.Code);
+
+        FakeStudioSessionClient OtherClient = new(FakeStudioSessionClient.AllCapabilities, "fake-session-2");
+        StudioGargantuanAdapter OtherAdapter = await StudioGargantuanAdapter.CreateAsync(OtherClient);
+        GargantuanAdapterException SessionCollision = await Assert.ThrowsAsync<GargantuanAdapterException>(() =>
+            OtherAdapter.ListInstancesAsync(new(null, 2, null, null, NullScoped.NextPageToken, 2), default));
+        Assert.Equal(GargantuanErrorCode.InvalidArgument, SessionCollision.Code);
+    }
+
+    [Fact]
     public async Task InstanceSchemaAndSelectionConversionAreBounded()
     {
         FakeStudioSessionClient Client = new(FakeStudioSessionClient.AllCapabilities);
@@ -262,6 +289,28 @@ public sealed class StudioGargantuanAdapterTests
         Assert.Equal(1, Client.ProjectWriteCalls);
     }
 
+    [Theory]
+    [InlineData(false, false, false)]
+    [InlineData(true, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(true, true, true)]
+    public async Task DestructiveWriteRequiresProjectAndDestructiveAuthority(
+        bool AllowProjectWrite, bool AllowDestructiveWrite, bool ExpectedSuccess)
+    {
+        FakeStudioSessionClient Client = new(FakeStudioSessionClient.AllCapabilities);
+        StudioGargantuanAdapter Adapter = await StudioGargantuanAdapter.CreateAsync(Client);
+        ProjectInfo Project = await Adapter.GetProjectInfoAsync(default);
+        ToolExecutor Executor = new(NullLogger<ToolExecutor>.Instance);
+        ProjectWriteTools Tools = new(Adapter, Executor, new LocalToolPolicy(
+            AllowProjectWrite: AllowProjectWrite, AllowDestructiveWrite: AllowDestructiveWrite));
+
+        ToolResponse<ProjectWriteResult> Result = await Tools.Delete(Project.RootId.Value, true);
+
+        Assert.Equal(ExpectedSuccess, Result.Success);
+        Assert.Equal(ExpectedSuccess ? null : nameof(GargantuanErrorCode.PermissionDenied), Result.Error?.Code);
+        Assert.Equal(ExpectedSuccess ? 1 : 0, Client.ProjectWriteCalls);
+    }
+
     [Fact]
     public async Task ProjectWriteCancellationAndStaleIdentityArePreserved()
     {
@@ -313,6 +362,14 @@ public sealed class StudioGargantuanAdapterTests
         Assert.False(ToolRegistrationPolicy.CanAdvertiseProjectWrite(ReadOnly, new LocalToolPolicy(AllowProjectWrite: true)));
         Assert.False(ToolRegistrationPolicy.CanAdvertiseProjectWrite(ProjectWritable, new LocalToolPolicy()));
         Assert.True(ToolRegistrationPolicy.CanAdvertiseProjectWrite(ProjectWritable, new LocalToolPolicy(AllowProjectWrite: true)));
+        Assert.False(ToolRegistrationPolicy.CanAdvertiseDestructiveWrite(ProjectWritable,
+            new LocalToolPolicy(AllowProjectWrite: false, AllowDestructiveWrite: false)));
+        Assert.False(ToolRegistrationPolicy.CanAdvertiseDestructiveWrite(ProjectWritable,
+            new LocalToolPolicy(AllowProjectWrite: true, AllowDestructiveWrite: false)));
+        Assert.False(ToolRegistrationPolicy.CanAdvertiseDestructiveWrite(ProjectWritable,
+            new LocalToolPolicy(AllowProjectWrite: false, AllowDestructiveWrite: true)));
+        Assert.True(ToolRegistrationPolicy.CanAdvertiseDestructiveWrite(ProjectWritable,
+            new LocalToolPolicy(AllowProjectWrite: true, AllowDestructiveWrite: true)));
     }
 
     private sealed class FakeStudioSessionClient : IStudioSessionClient
@@ -333,9 +390,9 @@ public sealed class StudioGargantuanAdapterTests
         public static StudioProjectWriteResult SuccessfulWrite { get; } =
             new(new StudioObjectIdentity(10, 2), 18, 16, true, "MCP write", []);
 
-        public FakeStudioSessionClient(IReadOnlySet<StudioBridgeCapability> Capabilities)
+        public FakeStudioSessionClient(IReadOnlySet<StudioBridgeCapability> Capabilities, string SessionId = "fake-session-1")
         {
-            Descriptor = new("fake-session-1", "DeterministicFakeStudioBridge", "2A-test", Capabilities);
+            Descriptor = new(SessionId, "DeterministicFakeStudioBridge", "2A-test", Capabilities);
         }
 
         public Exception? GetProjectFailure { get; set; }

@@ -175,14 +175,15 @@ public sealed class LocalToolPolicy
 {
     private readonly IReadOnlyDictionary<ToolRiskClass, PolicyDecision> Decisions;
 
-    public LocalToolPolicy(bool AllowStudioLocalWrite = false, bool AllowProjectWrite = false)
+    public LocalToolPolicy(bool AllowStudioLocalWrite = false, bool AllowProjectWrite = false,
+        bool AllowDestructiveWrite = false)
     {
         Decisions = new Dictionary<ToolRiskClass, PolicyDecision>
         {
             [ToolRiskClass.Read] = PolicyDecision.Allow,
             [ToolRiskClass.StudioLocalWrite] = AllowStudioLocalWrite ? PolicyDecision.Allow : PolicyDecision.RequireApproval,
             [ToolRiskClass.ProjectWrite] = AllowProjectWrite ? PolicyDecision.Allow : PolicyDecision.RequireApproval,
-            [ToolRiskClass.DestructiveWrite] = PolicyDecision.Deny,
+            [ToolRiskClass.DestructiveWrite] = AllowDestructiveWrite ? PolicyDecision.Allow : PolicyDecision.Deny,
             [ToolRiskClass.Execution] = PolicyDecision.Deny,
         };
     }

@@ -362,18 +362,12 @@ public sealed class StudioSessionClient : IStudioSessionClient, IAsyncDisposable
 
     private static async Task<StudioBridgeDescriptor> ReadDescriptorAsync(string DescriptorPath, CancellationToken CancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(DescriptorPath) || !Path.IsPathFullyQualified(DescriptorPath))
-            throw new StudioBridgeException(StudioBridgeErrorCode.InvalidArgument, "An absolute Studio bridge descriptor path is required.");
         string FullPath;
-        try { FullPath = Path.GetFullPath(DescriptorPath); }
+        try { FullPath = StudioDescriptorPathPolicy.ValidateForRead(DescriptorPath); }
         catch (Exception Exception) when (Exception is ArgumentException or NotSupportedException or PathTooLongException)
         {
             throw new StudioBridgeException(StudioBridgeErrorCode.InvalidArgument, "The Studio bridge descriptor path is invalid.", Exception);
         }
-        string LocalRoot = Path.GetFullPath(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData))
-            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        if (!FullPath.StartsWith(LocalRoot, StringComparison.OrdinalIgnoreCase))
-            throw new StudioBridgeException(StudioBridgeErrorCode.InvalidArgument, "The Studio bridge descriptor must be inside LocalApplicationData.");
 
         byte[] Payload;
         try

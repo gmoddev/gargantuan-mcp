@@ -9,6 +9,7 @@ using ModelContextProtocol.Server;
 
 bool AllowStudioLocalWrite = args.Contains("--allow-studio-local-write", StringComparer.Ordinal);
 bool AllowProjectWrite = args.Contains("--allow-project-write", StringComparer.Ordinal);
+bool AllowDestructiveWrite = args.Contains("--allow-destructive-write", StringComparer.Ordinal);
 string? StudioBridgeDescriptorPath;
 try
 {
@@ -53,7 +54,7 @@ catch (GargantuanAdapterException Exception)
 HostApplicationBuilder Builder = Host.CreateApplicationBuilder(args);
 Builder.Logging.ClearProviders();
 Builder.Logging.AddConsole(Options => Options.LogToStandardErrorThreshold = LogLevel.Trace);
-LocalToolPolicy Policy = new(AllowStudioLocalWrite, AllowProjectWrite);
+LocalToolPolicy Policy = new(AllowStudioLocalWrite, AllowProjectWrite, AllowDestructiveWrite);
 Builder.Services.AddSingleton<IGargantuanAdapter>(Adapter);
 Builder.Services.AddSingleton(Policy);
 Builder.Services.AddSingleton<ToolExecutor>();
@@ -72,6 +73,9 @@ if (ToolRegistrationPolicy.CanAdvertiseSelectionWrite(Adapter.Descriptor, Policy
 
 if (ToolRegistrationPolicy.CanAdvertiseProjectWrite(Adapter.Descriptor, Policy))
     McpBuilder.WithTools<McpProjectWriteTools>();
+
+if (ToolRegistrationPolicy.CanAdvertiseDestructiveWrite(Adapter.Descriptor, Policy))
+    McpBuilder.WithTools<McpDestructiveWriteTools>();
 
 IHost ServerHost = Builder.Build();
 try
